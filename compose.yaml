@@ -1,0 +1,28 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      FUNDING_ARB_DB: /data/funding_arb.db
+
+  scanner:
+    build: .
+    profiles: ["scan"]
+    command:
+      [
+        "funding-arb-monitor",
+        "--db",
+        "/data/funding_arb.db",
+        "scan",
+        "--days",
+        "30",
+        "--alert",
+      ]
+    volumes:
+      - ./data:/data
+    environment:
+      FUNDING_ARB_DB: /data/funding_arb.db
+      FUNDING_ARB_WEBHOOK_URL: ${FUNDING_ARB_WEBHOOK_URL:-}
