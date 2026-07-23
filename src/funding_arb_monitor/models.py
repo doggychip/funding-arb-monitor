@@ -41,6 +41,8 @@ class Candidate:
     realized_apr_pct: float
     realized_7d_apr_pct: float | None
     realized_24h_apr_pct: float | None
+    estimated_net_7d_apr_pct: float | None
+    hedge_assessment: str
     negative_hour_share_pct: float
     peak_decay_halflife_hours: int | None
     eligible: bool

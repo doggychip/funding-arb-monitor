@@ -6,7 +6,12 @@ COPY src ./src
 RUN pip install --no-cache-dir .
 
 ENV FUNDING_ARB_DB=/data/funding_arb.db
+ENV FUNDING_ARB_SCHEDULER=1
+ENV FUNDING_ARB_TIMEZONE=Asia/Hong_Kong
 VOLUME ["/data"]
 EXPOSE 8080
 
-CMD ["funding-arb-monitor", "serve", "--host", "0.0.0.0", "--port", "8080"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\", \"8080\")}/healthz', timeout=3)"
+
+CMD ["sh", "-c", "funding-arb-monitor serve --host 0.0.0.0 --port ${PORT:-8080}"]

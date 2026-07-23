@@ -17,9 +17,16 @@ Current-hour funding APR is a snapshot, not a forecast. The scanner instead reco
 - an explicit long-perp/short-underlying flag for negative funding, because borrow must be
   independently verified.
 
-The tool still does not model fees, slippage, borrow, FX, underlying market-session gaps, or
-your own market impact. Equity perps are not a 24/7 delta-neutral arbitrage when the stock
-exchange is shut.
+Hourly runs fetch only funding records newer than the latest stored point. Public API requests
+are throttled and transient disconnects, HTTP 429 responses, and server errors use bounded
+exponential backoff. If one market still fails, the rest of the scan completes; cached data for
+that market is marked `funding_refresh_failed` and cannot pass the monitoring gates.
+
+Paper matching adds a conservative cost model (10 bps perp/hedge fill, 5% annual borrow, 7-day
+hold) and requires an exact same-asset Coinbase or Kraken spot book with ≥5× notional depth and
+≥10% executable net APR. Equity perps (`xyz:*`) usually fail exact-spot matching and are not a
+24/7 delta-neutral arb when the cash market is shut. FX, session gaps, and your own market
+impact are still out of scope.
 
 ## Run locally
 
@@ -31,11 +38,53 @@ pip install -e '.[dev]'
 # Fetch and persist a scan; prints only candidates and their rejection reasons.
 funding-arb-monitor scan --days 30 --min-oi 1000000
 
-# Run the read-only API, then visit http://127.0.0.1:8080/docs.
+# Run the read-only dashboard/API.
 funding-arb-monitor serve
 ```
 
-The API exposes `GET /healthz` and `GET /api/candidates`.
+Open http://127.0.0.1:8080 for the local dashboard. It shows scan status, candidates, the
+approval queue (plus match-rejection reasons), and open paper positions. FastAPI docs remain at
+http://127.0.0.1:8080/docs.
+
+Useful endpoints: `GET /healthz`, `GET /api/status`, `GET /api/candidates`,
+`GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
+`GET /api/paper/report`, and `POST /api/paper/recommendations/{id}/approve`.
+
+## Paper positions
+
+Paper positions are accounting entries only; they never create exchange orders or use credentials.
+The default notional is $1,000. Preferred flow is approval-gated matching against public spot books:
+
+```bash
+# Match eligible candidates to Coinbase/Kraken exact-asset books; persists rejection reasons.
+funding-arb-monitor paper recommend
+
+# Requote both legs, recheck gates/depth/net APR, then atomically open the simulated pair.
+# The command rejects deteriorated or expired recommendations.
+funding-arb-monitor paper approve --id 1
+
+# Accrue public funding into open simulated positions; idempotent per funding hour.
+funding-arb-monitor paper accrue
+
+# Refresh hedge marks, drift, net-after-exit, and conservative exit flags.
+funding-arb-monitor paper update
+
+# Summary of funding P&L, MTM, and costs.
+funding-arb-monitor paper report
+```
+
+Manual open still exists if you already know the hedge venue:
+
+```bash
+funding-arb-monitor paper open \
+  --coin XMR \
+  --hedge-venue coinbase \
+  --notional 1000
+```
+
+Monitoring-eligible ≠ tradeable. `paper recommend` often returns `[]` when eligible names have no
+exact liquid spot hedge (for example `CASHCAT` or `xyz:PALLADIUM`). Those outcomes are stored as
+match checks (`no_exact_spot_market`, thin depth, net APR below threshold) and shown on the dashboard.
 
 ## Alerts
 
@@ -46,26 +95,46 @@ export FUNDING_ARB_WEBHOOK_URL="https://example.invalid/webhook"
 funding-arb-monitor scan --alert
 ```
 
-No alert is sent when the variable is absent.
+Default alerts are dashboard/API only. No alert is sent when the variable is absent.
 
 ## Scheduling
 
-Run an hourly scan on the host:
+Hourly host cron (times are local):
 
 ```cron
-5 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor scan --days 30 --alert >> data/scanner.log 2>&1
+5 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor scan --days 30 --min-oi 1000000 >> data/scanner.log 2>&1
+7 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper recommend >> data/scanner.log 2>&1
+10 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper accrue >> data/scanner.log 2>&1
+12 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper update >> data/scanner.log 2>&1
+15 17 * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper report >> data/paper-report.log 2>&1
 ```
 
-Or use the one-shot Compose scanner:
+The Docker image runs the API and the same schedule in one process by default. Override
+`FUNDING_ARB_SCHEDULER=0` if another scheduler owns these jobs.
 
 ```bash
-docker compose --profile scan run --rm scanner
-docker compose up --build api
+docker build -t funding-arb-monitor .
+docker run --rm -p 8080:8080 -v funding-arb-data:/data \
+  -e FUNDING_ARB_APPROVAL_TOKEN="$(openssl rand -hex 32)" \
+  funding-arb-monitor
 ```
 
-## Graduation criteria for paper trading
+## Zeabur
 
-Do not add exchange keys until the monitor has retained enough scans to validate its gates.
-The next phase should be a separate paper-execution service that reconciles both legs, models
-fees/borrow/slippage, enforces hedge and liquidation limits, and has a kill switch. Live
-execution should remain a separate, opt-in project boundary.
+Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
+
+1. Keep the service at one replica so only one scheduler runs.
+2. Add a persistent volume mounted at `/data`.
+3. Set `FUNDING_ARB_APPROVAL_TOKEN` to a random secret. The dashboard asks for it only when
+   approving a paper recommendation; read-only pages remain public.
+4. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
+5. Generate a Zeabur domain after the health check at `/healthz` passes.
+
+The container honors Zeabur's `PORT` variable. Deleting or detaching the `/data` volume deletes
+the SQLite scan and paper-trading history.
+
+## Graduation criteria for live trading
+
+Do not add exchange keys until match checks show repeatable exact-asset hedges with positive
+executable net APR after costs, and paper positions survive conservative exits (net ≤ 0, funding
+flip, drift > 2%, or 7-day hold). Live execution should remain a separate, opt-in project boundary.

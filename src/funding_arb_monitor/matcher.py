@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import time
+from collections.abc import Iterable
+from datetime import datetime
+
+from .costs import CostAssumptions
+from .hyperliquid import HyperliquidClient
+from .store import Store
+from .venues import CoinbaseSpot, HedgeQuote, KrakenSpot
+
+
+class PaperMatcher:
+    def __init__(
+        self,
+        store: Store,
+        venues: Iterable[CoinbaseSpot | KrakenSpot] | None = None,
+        perp_client: HyperliquidClient | None = None,
+        *,
+        notional_usd: float = 1_000,
+        min_depth_multiple: float = 5,
+        min_net_apr_pct: float = 10,
+        max_open_positions: int = 3,
+        max_snapshot_age_seconds: int = 15 * 60,
+    ) -> None:
+        self.store = store
+        self.venues = list(venues or [CoinbaseSpot(), KrakenSpot()])
+        self.perp_client = perp_client or HyperliquidClient()
+        self.notional_usd = notional_usd
+        self.min_depth_multiple = min_depth_multiple
+        self.min_net_apr_pct = min_net_apr_pct
+        self.max_open_positions = max_open_positions
+        self.max_snapshot_age_seconds = max_snapshot_age_seconds
+        self.costs = CostAssumptions()
+        self.perp_fee_bps = self.costs.perp_fill_bps
+
+    def recommend(self) -> list[dict[str, object]]:
+        created: list[dict[str, object]] = []
+        for candidate in self.store.latest_candidates():
+            if not candidate.get("eligible") or candidate.get("side") != "short_perp_long_hedge":
+                continue
+            coin = str(candidate["coin"])
+            analyzed_at = str(candidate["analyzed_at"])
+            if self.store.has_open_paper_position(coin):
+                self._record_check(analyzed_at, coin, "already_open", "paper position already open")
+                continue
+            quote, match_status = self._best_quote(self._asset(coin))
+            if quote is None:
+                self._record_check(analyzed_at, coin, match_status, match_status.replace("_", " "))
+                continue
+            gross_apr = float(candidate["realized_7d_apr_pct"])
+            net_apr = self._net_apr(gross_apr, quote)
+            if net_apr < self.min_net_apr_pct:
+                self._record_check(
+                    analyzed_at,
+                    coin,
+                    "net_carry_below_threshold",
+                    f"executable net APR {net_apr:.1f}% < {self.min_net_apr_pct:.1f}%",
+                )
+                continue
+            snapshot = self.store.latest_market_snapshot(coin)
+            if snapshot is None:
+                self._record_check(analyzed_at, coin, "missing_perp_snapshot", "no current perp mark")
+                continue
+            captured_at = datetime.fromisoformat(str(snapshot["captured_at"])).timestamp()
+            if time.time() - captured_at > self.max_snapshot_age_seconds:
+                self._record_check(
+                    analyzed_at,
+                    coin,
+                    "stale_perp_snapshot",
+                    f"perp snapshot is older than {self.max_snapshot_age_seconds // 60} minutes",
+                )
+                continue
+            now_ms = int(time.time() * 1000)
+            perp_price = float(snapshot["mark_price"])
+            recommendation = {
+                "created_at_ms": now_ms,
+                "expires_at_ms": now_ms + 3_600_000,
+                "status": "pending",
+                "coin": candidate["coin"],
+                "candidate_analyzed_at": candidate["analyzed_at"],
+                "side": candidate["side"],
+                **self._execution(gross_apr, quote, perp_price),
+            }
+            recommendation_id = self.store.save_paper_recommendation(recommendation)
+            if recommendation_id is not None:
+                recommendation["id"] = recommendation_id
+                created.append(recommendation)
+            self._record_check(
+                analyzed_at,
+                coin,
+                "pending_approval",
+                f"{quote.venue} {quote.symbol}; executable net APR {net_apr:.1f}%",
+            )
+        return created
+
+    def approve(self, recommendation_id: int) -> dict[str, object]:
+        recommendation = self.store.paper_recommendation(recommendation_id)
+        if recommendation is None:
+            raise ValueError("recommendation not found")
+        if recommendation["status"] != "pending":
+            raise ValueError(f"recommendation is {recommendation['status']}")
+        if int(recommendation["expires_at_ms"]) < int(time.time() * 1000):
+            self.store.set_recommendation_status(recommendation_id, "expired")
+            raise ValueError("recommendation expired; generate a fresh quote")
+        coin = str(recommendation["coin"])
+        candidate = self.store.latest_candidate(coin)
+        if (
+            candidate is None
+            or not candidate.get("eligible")
+            or candidate.get("side") != "short_perp_long_hedge"
+        ):
+            raise ValueError("candidate no longer passes monitoring gates")
+        venue = next(
+            (item for item in self.venues if item.name == recommendation["venue"]),
+            None,
+        )
+        if venue is None:
+            raise ValueError("recommended spot venue is unavailable")
+        try:
+            quote = venue.quote(self._asset(coin), self.notional_usd)
+        except RuntimeError as exc:
+            raise ValueError(f"spot requote failed: {exc}") from exc
+        if quote is None or quote.symbol != recommendation["hedge_symbol"]:
+            raise ValueError("exact spot market is no longer available")
+        required_depth = self.notional_usd * self.min_depth_multiple
+        if quote.bid_depth_usd < required_depth or quote.ask_depth_usd < required_depth:
+            raise ValueError("spot depth is now below 5x notional")
+        gross_apr = float(candidate["realized_7d_apr_pct"])
+        net_apr = self._net_apr(gross_apr, quote)
+        if net_apr < self.min_net_apr_pct:
+            raise ValueError(
+                f"executable net APR is now {net_apr:.1f}% < {self.min_net_apr_pct:.1f}%"
+            )
+        try:
+            snapshot = self.perp_client.market_snapshot(coin, str(candidate["dex"]))
+        except RuntimeError as exc:
+            raise ValueError(f"perp requote failed: {exc}") from exc
+        if snapshot is None:
+            raise ValueError("perp market is no longer available")
+        execution = self._execution(gross_apr, quote, snapshot.mark_price)
+        position_id = self.store.approve_paper_recommendation(
+            recommendation_id,
+            max_open_positions=self.max_open_positions,
+            execution=execution,
+        )
+        position = self.store.paper_position(position_id)
+        if position is None:
+            raise RuntimeError("approved paper position was not persisted")
+        return position
+
+    def _net_apr(self, gross_apr: float, quote: HedgeQuote) -> float:
+        total_round_trip_bps = (
+            self.perp_fee_bps * 2 + quote.entry_cost_bps + quote.exit_cost_bps
+        )
+        annualized_cost_pct = (
+            total_round_trip_bps / 10_000 * 365 / self.costs.holding_days * 100
+        )
+        return gross_apr - annualized_cost_pct - self.costs.annual_borrow_pct
+
+    def _execution(
+        self, gross_apr: float, quote: HedgeQuote, perp_price: float
+    ) -> dict[str, object]:
+        return {
+            "venue": quote.venue,
+            "hedge_symbol": quote.symbol,
+            "notional_usd": self.notional_usd,
+            "quantity": self.notional_usd / perp_price,
+            "perp_entry_price": perp_price,
+            "hedge_entry_price": quote.executable_buy_price,
+            "gross_apr_pct": gross_apr,
+            "executable_net_apr_pct": self._net_apr(gross_apr, quote),
+            "hedge_fee_bps": quote.fee_bps,
+            "hedge_spread_bps": quote.spread_bps,
+            "bid_depth_usd": quote.bid_depth_usd,
+            "ask_depth_usd": quote.ask_depth_usd,
+            "entry_cost_usd": self.notional_usd
+            * (self.perp_fee_bps + quote.entry_cost_bps)
+            / 10_000,
+            "estimated_exit_cost_usd": self.notional_usd
+            * (self.perp_fee_bps + quote.exit_cost_bps)
+            / 10_000,
+        }
+
+    def _best_quote(self, asset: str) -> tuple[HedgeQuote | None, str]:
+        quotes: list[HedgeQuote] = []
+        required_depth = self.notional_usd * self.min_depth_multiple
+        quote_found = False
+        venue_errors = 0
+        for venue in self.venues:
+            try:
+                quote = venue.quote(asset, self.notional_usd)
+            except RuntimeError:
+                venue_errors += 1
+                continue
+            if quote is not None:
+                quote_found = True
+                if (
+                    quote.bid_depth_usd >= required_depth
+                    and quote.ask_depth_usd >= required_depth
+                ):
+                    quotes.append(quote)
+        if quotes:
+            return (
+                min(quotes, key=lambda quote: quote.entry_cost_bps + quote.exit_cost_bps),
+                "matched",
+            )
+        if quote_found:
+            return None, "spot_depth_below_5x_notional"
+        if venue_errors == len(self.venues):
+            return None, "all_spot_venues_unavailable"
+        return None, "no_exact_spot_market"
+
+    def _record_check(self, analyzed_at: str, coin: str, status: str, detail: str) -> None:
+        self.store.save_paper_match_check(
+            candidate_analyzed_at=analyzed_at,
+            coin=coin,
+            status=status,
+            detail=detail,
+        )
+
+    @staticmethod
+    def _asset(coin: str) -> str:
+        return coin.split(":", 1)[-1]
