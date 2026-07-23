@@ -19,7 +19,8 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     dashboard = client.get("/")
     assert dashboard.status_code == 200
     assert "Funding Arb Monitor" in dashboard.text
-    assert "Approval queue" in dashboard.text
+    assert "Trade recommendations &amp; proposed actions" in dashboard.text
+    assert "Monitor only; wait for an exact spot listing" in dashboard.text
     assert client.get("/api/candidates").json() == []
     assert client.get("/api/status").json()["status"] == "never_run"
     assert client.get("/api/paper/recommendations").json() == []

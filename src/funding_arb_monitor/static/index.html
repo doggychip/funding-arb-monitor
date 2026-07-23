@@ -119,19 +119,18 @@
       <div id="empty">No persisted scan yet. Run <code>funding-arb-monitor scan</code>, then refresh this page.</div>
     </section>
     <section style="margin-top: 20px">
-      <h2>Approval queue</h2>
-      <p class="subtle">Exact-asset spot matches with positive executable net carry. Approval requotes both legs and rechecks depth/net APR before opening a simulated position.</p>
+      <h2>Trade recommendations &amp; proposed actions</h2>
+      <p class="subtle">Every market that passed monitoring gates is listed with its executable hedge result and next action. Approval requotes both legs before opening a simulated position.</p>
       <div class="panel">
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Market</th><th>Hedge</th><th>Gross APR</th><th>Executable net APR</th><th>Spread</th><th>Depth</th><th>Status</th></tr>
+              <tr><th>Market</th><th>Structure</th><th>Gross APR</th><th>Hedge</th><th>Executable net APR</th><th>Match result</th><th>Proposed action</th></tr>
             </thead>
             <tbody id="recommendation-rows"></tbody>
           </table>
         </div>
-        <div id="recommendation-empty">No qualified exact-asset spot hedge is awaiting approval.</div>
-        <div id="match-checks" class="notice"></div>
+        <div id="recommendation-empty">No market currently passes the monitoring gates.</div>
       </div>
     </section>
     <section style="margin-top: 20px">
@@ -225,24 +224,50 @@
     async function loadRecommendations() {
       const response = await fetch("/api/paper/recommendations");
       const recommendations = response.ok ? await response.json() : [];
-      const pending = recommendations.filter((item) => item.status === "pending");
-      document.querySelector("#recommendation-rows").innerHTML = pending.map((item) => `
-        <tr>
-          <td>${escapeHtml(item.coin)}</td>
-          <td>${escapeHtml(`${item.venue} · ${item.hedge_symbol}`)}</td>
-          <td class="positive">${percent(item.gross_apr_pct)}</td>
-          <td class="positive">${percent(item.executable_net_apr_pct)}</td>
-          <td>${item.hedge_spread_bps.toFixed(1)} bps</td>
-          <td>${money.format(Math.min(item.bid_depth_usd, item.ask_depth_usd))}</td>
-          <td><button type="button" data-approve="${item.id}">Approve $${item.notional_usd.toFixed(0)} paper pair</button></td>
-        </tr>
-      `).join("");
-      document.querySelector("#recommendation-empty").style.display = pending.length ? "none" : "block";
+      const pendingByCoin = new Map(
+        recommendations.filter((item) => item.status === "pending").map((item) => [item.coin, item])
+      );
       const checksResponse = await fetch("/api/paper/match-checks");
       const checks = checksResponse.ok ? await checksResponse.json() : [];
-      document.querySelector("#match-checks").innerHTML = checks.map((check) =>
-        `<div>${escapeHtml(check.coin)}: ${escapeHtml(check.detail)}</div>`
-      ).join("");
+      const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
+      const ideas = candidates.filter((item) => item.eligible);
+
+      const proposedAction = (status, recommendation) => {
+        if (recommendation) {
+          return `<button type="button" data-approve="${recommendation.id}">Approve $${recommendation.notional_usd.toFixed(0)} paper pair</button>`;
+        }
+        return escapeHtml(({
+          no_exact_spot_market: "Monitor only; wait for an exact spot listing",
+          spot_depth_below_5x_notional: "Skip now; recheck depth next hour",
+          net_carry_below_threshold: "Skip; carry does not clear costs",
+          all_spot_venues_unavailable: "Retry automatically next hour",
+          missing_perp_snapshot: "Wait for a fresh perp snapshot",
+          stale_perp_snapshot: "Wait for the next successful scan",
+          already_open: "Track the existing paper position",
+          pending_approval: "Generate a fresh executable quote"
+        })[status] || "Continue monitoring; no paper action");
+      };
+
+      document.querySelector("#recommendation-rows").innerHTML = ideas.map((candidate) => {
+        const recommendation = pendingByCoin.get(candidate.coin);
+        const check = checksByCoin.get(candidate.coin);
+        const status = check?.status || (recommendation ? "pending_approval" : "not_checked");
+        const hedge = recommendation
+          ? `${recommendation.venue} · ${recommendation.hedge_symbol}`
+          : "No executable hedge";
+        const result = check?.detail || status.replaceAll("_", " ");
+        return `
+        <tr>
+          <td>${escapeHtml(candidate.coin)}</td>
+          <td>${escapeHtml(candidate.side.replaceAll("_", " "))}</td>
+          <td class="${numberClass(candidate.realized_7d_apr_pct)}">${percent(candidate.realized_7d_apr_pct)}</td>
+          <td>${escapeHtml(hedge)}</td>
+          <td class="${numberClass(recommendation?.executable_net_apr_pct ?? 0)}">${percent(recommendation?.executable_net_apr_pct)}</td>
+          <td><span class="badge ${recommendation ? "eligible" : "review"}">${escapeHtml(result)}</span></td>
+          <td>${proposedAction(status, recommendation)}</td>
+        </tr>
+      `}).join("");
+      document.querySelector("#recommendation-empty").style.display = ideas.length ? "none" : "block";
     }
 
     async function loadPaper() {
