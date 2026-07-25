@@ -73,3 +73,22 @@ def test_scanner_uses_cached_history_but_marks_refresh_failure(tmp_path) -> None
     assert len(candidates) == 1
     assert candidates[0].eligible is False
     assert "funding_refresh_failed" in candidates[0].reasons
+
+
+def test_scanner_alerts_on_full_scan_failure(tmp_path, monkeypatch) -> None:
+    alerts = []
+    monkeypatch.setattr(
+        "funding_arb_monitor.scanner.send_discord_alert",
+        lambda message: alerts.append(message),
+    )
+    client = FakeClient()
+    monkeypatch.setattr(client, "snapshots", lambda: [])
+
+    with pytest.raises(RuntimeError, match="no live markets"):
+        Scanner(
+            client,  # type: ignore[arg-type]
+            Store(tmp_path / "test.db"),
+            ScanConfig(),
+        ).run()
+
+    assert "Funding monitor scan failed" in alerts[0]

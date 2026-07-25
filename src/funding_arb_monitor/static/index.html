@@ -57,11 +57,18 @@
     .badge.review { border-color: var(--amber); color: var(--amber); }
     #empty { color: var(--muted); display: none; padding: 28px 0 8px; }
     .notice { color: var(--muted); font-size: 12px; margin-top: 14px; }
+    .charts { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-top: 14px; }
+    .chart { background: var(--surface-2); border-radius: 6px; padding: 10px; min-width: 0; }
+    .chart h3 { color: var(--muted); font-size: 12px; font-weight: 550; margin: 0 0 6px; }
+    .chart svg { display: block; height: 240px; overflow: visible; width: 100%; }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; }
+    .legend span::before { background: var(--color); border-radius: 50%; content: ""; display: inline-block; height: 8px; margin-right: 5px; width: 8px; }
     @media (max-width: 720px) {
       main { padding: 20px 12px 40px; }
       .header { display: block; }
       .header button { margin-top: 16px; }
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .charts { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -151,12 +158,37 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Market</th><th>Hedge venue</th><th>Notional</th><th>Funding P&L</th><th>Pair MTM</th><th>Drift</th><th>Net after est. exit</th><th>Hedge review</th></tr>
+              <tr><th>Market</th><th>Hedge venue</th><th>Status</th><th>Notional</th><th>Funding P&L</th><th>Pair MTM</th><th>Drift</th><th>Net after exit</th><th>Timeline</th></tr>
             </thead>
             <tbody id="paper-rows"></tbody>
           </table>
         </div>
         <div id="paper-empty">No paper positions yet. Use <code>funding-arb-monitor paper open</code> to create a simulated paired hedge.</div>
+      </div>
+    </section>
+    <section id="timeline-section" style="display: none; margin-top: 20px">
+      <h2 id="timeline-title">Position timeline</h2>
+      <p class="subtle" id="timeline-detail"></p>
+      <div class="panel" style="margin-top: 10px">
+        <div class="charts">
+          <div class="chart">
+            <h3>Cumulative P&amp;L (USD)</h3>
+            <svg id="pnl-chart" role="img" aria-label="Position profit and loss timeline"></svg>
+            <div class="legend">
+              <span style="--color: #44c580">Net P&amp;L</span>
+              <span style="--color: #7db3ff">Funding P&amp;L</span>
+              <span style="--color: #e7b95a">Pair MTM</span>
+            </div>
+          </div>
+          <div class="chart">
+            <h3>Perp–hedge basis and drift (%)</h3>
+            <svg id="basis-chart" role="img" aria-label="Position basis and hedge drift timeline"></svg>
+            <div class="legend">
+              <span style="--color: #b28dff">Signed basis</span>
+              <span style="--color: #ef7474">Absolute drift</span>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
     <p class="notice">
@@ -293,21 +325,87 @@
     }
 
     async function loadPaper() {
-      const response = await fetch("/api/paper/positions");
+      const response = await fetch("/api/paper/positions?include_closed=true");
       const positions = response.ok ? await response.json() : [];
       document.querySelector("#paper-rows").innerHTML = positions.map((position) => `
         <tr>
           <td>${escapeHtml(position.coin)}</td>
           <td>${escapeHtml(position.hedge_venue)}</td>
+          <td><span class="badge ${position.closed_at_ms == null ? "eligible" : "review"}">${position.closed_at_ms == null ? "Open" : escapeHtml(position.exit_reason.replaceAll("_", " "))}</span></td>
           <td>${money.format(position.notional_usd)}</td>
           <td class="${numberClass(position.funding_pnl_usd)}">${money.format(position.funding_pnl_usd)}</td>
           <td class="${numberClass(position.mark_to_market_pnl_usd)}">${money.format(position.mark_to_market_pnl_usd)}</td>
           <td>${position.hedge_drift_pct == null ? "—" : `${position.hedge_drift_pct.toFixed(2)}%`}</td>
           <td class="${numberClass(position.net_pnl_usd)}">${money.format(position.net_pnl_usd)}</td>
-          <td><span class="badge review">${escapeHtml(position.hedge_assessment.replaceAll("_", " "))}</span></td>
+          <td><button type="button" data-timeline="${position.id}">View chart</button></td>
         </tr>
       `).join("");
       document.querySelector("#paper-empty").style.display = positions.length ? "none" : "block";
+    }
+
+    function renderLineChart(selector, points, series, formatValue) {
+      const svg = document.querySelector(selector);
+      const width = 900;
+      const height = 240;
+      const pad = { left: 62, right: 14, top: 12, bottom: 30 };
+      const values = series.flatMap((item) =>
+        points.map((point) => point[item.key]).filter((value) => Number.isFinite(value))
+      );
+      if (!points.length || !values.length) {
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.innerHTML = `<text x="20" y="35" fill="#a8b0bb">No observations yet</text>`;
+        return;
+      }
+      let minY = Math.min(...values, 0);
+      let maxY = Math.max(...values, 0);
+      if (minY === maxY) {
+        minY -= 1;
+        maxY += 1;
+      }
+      const minX = points[0].timestamp_ms;
+      const maxX = points[points.length - 1].timestamp_ms;
+      const x = (timestamp) => pad.left + (timestamp - minX) / Math.max(1, maxX - minX) * (width - pad.left - pad.right);
+      const y = (value) => pad.top + (maxY - value) / (maxY - minY) * (height - pad.top - pad.bottom);
+      const grid = [0, 0.5, 1].map((ratio) => {
+        const value = maxY - ratio * (maxY - minY);
+        const cy = y(value);
+        return `<line x1="${pad.left}" y1="${cy}" x2="${width - pad.right}" y2="${cy}" stroke="#343a43" stroke-width="1"/>
+          <text x="${pad.left - 8}" y="${cy + 4}" fill="#a8b0bb" font-size="11" text-anchor="end">${escapeHtml(formatValue(value))}</text>`;
+      }).join("");
+      const lines = series.map((item) => {
+        const coordinates = points
+          .filter((point) => Number.isFinite(point[item.key]))
+          .map((point) => `${x(point.timestamp_ms)},${y(point[item.key])}`)
+          .join(" ");
+        return `<polyline points="${coordinates}" fill="none" stroke="${item.color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+      }).join("");
+      const start = new Date(minX).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      const end = new Date(maxX).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.innerHTML = `${grid}${lines}
+        <text x="${pad.left}" y="${height - 7}" fill="#a8b0bb" font-size="11">${escapeHtml(start)}</text>
+        <text x="${width - pad.right}" y="${height - 7}" fill="#a8b0bb" font-size="11" text-anchor="end">${escapeHtml(end)}</text>`;
+    }
+
+    async function loadTimeline(positionId) {
+      const response = await fetch(`/api/paper/positions/${positionId}/timeline`);
+      if (!response.ok) return;
+      const timeline = await response.json();
+      const position = timeline.position;
+      document.querySelector("#timeline-title").textContent = `${position.coin} position timeline`;
+      document.querySelector("#timeline-detail").textContent =
+        `${position.closed_at_ms == null ? "Open" : "Closed"} · ${position.hedge_venue} ${position.hedge_symbol || ""} · ${timeline.points.length} observations`;
+      document.querySelector("#timeline-section").style.display = "block";
+      renderLineChart("#pnl-chart", timeline.points, [
+        { key: "net_pnl_usd", color: "#44c580" },
+        { key: "funding_pnl_usd", color: "#7db3ff" },
+        { key: "pair_mtm_usd", color: "#e7b95a" }
+      ], (value) => `$${value.toFixed(1)}`);
+      renderLineChart("#basis-chart", timeline.points, [
+        { key: "basis_pct", color: "#b28dff" },
+        { key: "hedge_drift_pct", color: "#ef7474" }
+      ], (value) => `${value.toFixed(2)}%`);
+      document.querySelector("#timeline-section").scrollIntoView({ behavior: "smooth", block: "start" });
     }
 
     async function loadPerformance() {
@@ -353,6 +451,10 @@
         alert(error.detail || "Approval failed");
       }
       await load();
+    });
+    document.querySelector("#paper-rows").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-timeline]");
+      if (button) loadTimeline(button.dataset.timeline);
     });
     ["#search", "#status", "#min-apr"].forEach((selector) => document.querySelector(selector).addEventListener("input", render));
     load();

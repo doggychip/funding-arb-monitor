@@ -102,3 +102,33 @@ def test_paper_performance_summarizes_closed_trades(tmp_path) -> None:
         "maximum_7d_holding_period": 1,
         "funding_flipped_for_3_hours": 1,
     }
+
+
+def test_paper_position_timeline_combines_funding_and_marks(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    position = PaperLedger(store).open(
+        PaperOpenRequest(coin="BTC", hedge_venue="spot-test")
+    )
+    timestamp_ms = int(position["opened_at_ms"]) + 3_600_000
+    store.save_paper_accruals(int(position["id"]), [(timestamp_ms, 1)])
+    store.save_paper_mark(
+        int(position["id"]),
+        timestamp_ms=timestamp_ms,
+        perp_price=101,
+        hedge_price=100,
+        perp_pnl_usd=10,
+        hedge_pnl_usd=-5,
+        hedge_drift_pct=0.995,
+    )
+
+    timeline = store.paper_position_timeline(int(position["id"]))
+
+    assert timeline is not None
+    assert timeline["position"]["coin"] == "BTC"
+    assert len(timeline["points"]) == 2
+    latest = timeline["points"][-1]
+    assert latest["funding_pnl_usd"] == 1
+    assert latest["pair_mtm_usd"] == 5
+    assert latest["basis_pct"] == pytest.approx(100 / 100.5)
+    assert latest["net_pnl_usd"] == pytest.approx(4, abs=0.01)

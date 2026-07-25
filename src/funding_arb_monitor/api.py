@@ -56,8 +56,15 @@ def create_app(database_path: str | None = None) -> FastAPI:
         return store.latest_scan_run() or {"status": "never_run"}
 
     @app.get("/api/paper/positions")
-    def paper_positions() -> list[dict[str, object]]:
-        return store.open_paper_positions()
+    def paper_positions(include_closed: bool = False) -> list[dict[str, object]]:
+        return store.paper_positions(include_closed=include_closed)
+
+    @app.get("/api/paper/positions/{position_id}/timeline")
+    def paper_position_timeline(position_id: int) -> dict[str, object]:
+        timeline = store.paper_position_timeline(position_id)
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="paper position not found")
+        return timeline
 
     @app.get("/api/paper/recommendations")
     def paper_recommendations() -> list[dict[str, object]]:

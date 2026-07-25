@@ -4,6 +4,7 @@ import time
 from collections.abc import Iterable
 from datetime import datetime
 
+from .alerts import render_shadow_entry, send_discord_alert
 from .costs import CostAssumptions
 from .hyperliquid import HyperliquidClient
 from .store import Store
@@ -123,7 +124,13 @@ class PaperMatcher:
         for recommendation in recommendations:
             recommendation_id = int(recommendation["id"])
             try:
-                opened.append(self.approve(recommendation_id, approval_mode="shadow_auto"))
+                position = self.approve(recommendation_id, approval_mode="shadow_auto")
+                opened.append(position)
+                send_discord_alert(
+                    render_shadow_entry(
+                        position, float(recommendation["executable_net_apr_pct"])
+                    )
+                )
             except ValueError as exc:
                 rejected.append({"id": recommendation_id, "reason": str(exc)})
         return {

@@ -141,10 +141,15 @@ def test_approval_rejects_deteriorated_spot_depth(tmp_path) -> None:
     assert store.paper_recommendation(recommendation_id)["status"] == "pending"
 
 
-def test_shadow_workflow_auto_opens_simulated_position(tmp_path) -> None:
+def test_shadow_workflow_auto_opens_simulated_position(tmp_path, monkeypatch) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
     seed_candidate(store)
+    alerts = []
+    monkeypatch.setattr(
+        "funding_arb_monitor.matcher.send_discord_alert",
+        lambda message: alerts.append(message),
+    )
     matcher = PaperMatcher(
         store,
         venues=[FakeVenue()],  # type: ignore[list-item]
@@ -158,3 +163,4 @@ def test_shadow_workflow_auto_opens_simulated_position(tmp_path) -> None:
     assert result["rejected"] == []
     position = store.open_paper_positions()[0]
     assert position["notes"] == "Auto-opened by the shadow paper scheduler."
+    assert "Shadow paper position opened" in alerts[0]

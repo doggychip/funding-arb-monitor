@@ -742,6 +742,99 @@ class Store:
                 (int(time.time() * 1000), reason, exit_cost_usd, position_id),
             )
 
+    def paper_position_timeline(self, position_id: int) -> dict[str, object] | None:
+        position = self.paper_position(position_id)
+        if position is None:
+            return None
+        with self.connect() as connection:
+            marks = connection.execute(
+                """
+                SELECT timestamp_ms, perp_price, hedge_price, perp_pnl_usd,
+                    hedge_pnl_usd, hedge_drift_pct
+                FROM paper_position_marks
+                WHERE position_id = ?
+                ORDER BY timestamp_ms
+                """,
+                (position_id,),
+            ).fetchall()
+            accruals = connection.execute(
+                """
+                SELECT timestamp_ms, funding_pnl_usd
+                FROM paper_accruals
+                WHERE position_id = ?
+                ORDER BY timestamp_ms
+                """,
+                (position_id,),
+            ).fetchall()
+
+        marks_by_time = {int(row["timestamp_ms"]): row for row in marks}
+        funding_by_time = {
+            int(row["timestamp_ms"]): float(row["funding_pnl_usd"]) for row in accruals
+        }
+        timestamps = {
+            int(position["opened_at_ms"]),
+            *marks_by_time,
+            *funding_by_time,
+        }
+        if position["closed_at_ms"] is not None:
+            timestamps.add(int(position["closed_at_ms"]))
+
+        cumulative_funding = 0.0
+        pair_mtm = 0.0
+        basis_pct: float | None = None
+        drift_pct: float | None = None
+        points: list[dict[str, object]] = []
+        for timestamp_ms in sorted(timestamps):
+            cumulative_funding += funding_by_time.get(timestamp_ms, 0)
+            mark = marks_by_time.get(timestamp_ms)
+            if mark is not None:
+                pair_mtm = float(mark["perp_pnl_usd"]) + float(mark["hedge_pnl_usd"])
+                midpoint = (float(mark["perp_price"]) + float(mark["hedge_price"])) / 2
+                basis_pct = (
+                    (float(mark["perp_price"]) - float(mark["hedge_price"]))
+                    / midpoint
+                    * 100
+                    if midpoint
+                    else None
+                )
+                drift_pct = float(mark["hedge_drift_pct"])
+            end_ms = min(
+                timestamp_ms,
+                int(position["closed_at_ms"] or timestamp_ms),
+            )
+            financing_cost = (
+                float(position["notional_usd"])
+                * CostAssumptions().annual_borrow_pct
+                / 100
+                * max(0, end_ms - int(position["opened_at_ms"]))
+                / (365 * 86_400_000)
+            )
+            exit_cost = (
+                float(position["exit_cost_usd"])
+                if position["closed_at_ms"] is not None
+                and timestamp_ms >= int(position["closed_at_ms"])
+                and position["exit_cost_usd"] is not None
+                else float(position["estimated_exit_cost_usd"] or 0)
+            )
+            points.append(
+                {
+                    "timestamp_ms": timestamp_ms,
+                    "funding_pnl_usd": cumulative_funding,
+                    "pair_mtm_usd": pair_mtm,
+                    "financing_cost_usd": financing_cost,
+                    "net_pnl_usd": (
+                        cumulative_funding
+                        + pair_mtm
+                        - float(position["entry_cost_usd"])
+                        - exit_cost
+                        - financing_cost
+                    ),
+                    "basis_pct": basis_pct,
+                    "hedge_drift_pct": drift_pct,
+                }
+            )
+        return {"position": position, "points": points}
+
     def paper_summary(self) -> dict[str, object]:
         positions = self.paper_positions()
         open_positions = [item for item in positions if item["closed_at_ms"] is None]

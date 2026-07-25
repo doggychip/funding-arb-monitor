@@ -24,9 +24,14 @@ class FakeVenue:
         )
 
 
-def test_tracker_closes_after_three_funding_flips(tmp_path) -> None:
+def test_tracker_closes_after_three_funding_flips(tmp_path, monkeypatch) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
+    alerts = []
+    monkeypatch.setattr(
+        "funding_arb_monitor.tracker.send_discord_alert",
+        lambda message: alerts.append(message),
+    )
     now = datetime.now(timezone.utc)
     store.save_snapshots(
         [MarketSnapshot("(main)", "TEST", -0.0001, 2_000_000, 1_000_000, 100, now)]
@@ -60,6 +65,7 @@ def test_tracker_closes_after_three_funding_flips(tmp_path) -> None:
     position = store.paper_position(position_id)
     assert position is not None
     assert position["exit_reason"] == "funding_flipped_for_3_hours"
+    assert "Shadow paper position closed" in alerts[0]
 
 
 def test_tracker_ignores_funding_flips_before_position_opened(tmp_path) -> None:

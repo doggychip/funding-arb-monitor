@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
+from .alerts import render_shadow_exit, send_discord_alert
 from .costs import CostAssumptions
 from .models import FundingPoint
 from .store import Store
@@ -98,6 +99,9 @@ class PaperPositionTracker:
                     reason=exit_reason,
                     exit_cost_usd=exit_cost,
                 )
+                closed_position = self.store.paper_position(int(position["id"]))
+                if closed_position is not None:
+                    send_discord_alert(render_shadow_exit(closed_position))
                 closed += 1
         return {"updated": updated, "closed": closed}
 

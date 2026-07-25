@@ -10,6 +10,7 @@ from .analytics import (
     realized_apr_pct,
     rolling_apr_pct,
 )
+from .alerts import render_scan_failure, send_discord_alert
 from .hyperliquid import HyperliquidClient
 from .costs import CostAssumptions, hedge_assessment
 from .models import Candidate, MarketSnapshot, utc_now
@@ -51,6 +52,7 @@ class Scanner:
             return self._run(run_id)
         except Exception as exc:
             self.store.finish_scan_run(run_id, status="failed", error=str(exc))
+            send_discord_alert(render_scan_failure(exc))
             raise
 
     def _run(self, run_id: int) -> list[Candidate]:

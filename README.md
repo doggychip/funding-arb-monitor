@@ -44,13 +44,14 @@ funding-arb-monitor scan --days 30 --min-oi 1000000
 funding-arb-monitor serve
 ```
 
-Open http://127.0.0.1:8080 for the local dashboard. It shows scan status, candidates, the
-approval queue (plus match-rejection reasons), and open paper positions. FastAPI docs remain at
-http://127.0.0.1:8080/docs.
+Open http://127.0.0.1:8080 for the local dashboard. It shows scan status, candidates, trade
+recommendations, performance, and P&L/basis timelines for open and closed paper positions. FastAPI
+docs remain at http://127.0.0.1:8080/docs.
 
 Useful endpoints: `GET /healthz`, `GET /api/status`, `GET /api/candidates`,
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
-`GET /api/paper/report`, `GET /api/paper/performance`, and
+`GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
+`GET /api/paper/performance`, and
 `POST /api/paper/recommendations/{id}/approve`.
 
 ## Paper positions
@@ -104,6 +105,16 @@ funding-arb-monitor scan --alert
 
 Default alerts are dashboard/API only. No alert is sent when the variable is absent.
 
+For Discord notifications on shadow entries, position exits, and full scan failures, set a Discord
+channel webhook URL:
+
+```bash
+export FUNDING_ARB_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+```
+
+Webhook delivery failures do not interrupt scanning or position tracking. Messages suppress Discord
+mentions and never include exchange credentials.
+
 ## Scheduling
 
 Hourly host cron (times are local):
@@ -134,8 +145,9 @@ Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
 2. Add a persistent volume mounted at `/data`.
 3. Set `FUNDING_ARB_APPROVAL_TOKEN` to a random secret. The dashboard asks for it only when
    approving a paper recommendation; read-only pages remain public.
-4. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
-5. Generate a Zeabur domain after the health check at `/healthz` passes.
+4. Set `FUNDING_ARB_DISCORD_WEBHOOK_URL` to enable operational paper-trading alerts.
+5. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
+6. Generate a Zeabur domain after the health check at `/healthz` passes.
 
 The container honors Zeabur's `PORT` variable. Deleting or detaching the `/data` volume deletes
 the SQLite scan and paper-trading history.
