@@ -22,11 +22,13 @@ are throttled and transient disconnects, HTTP 429 responses, and server errors u
 exponential backoff. If one market still fails, the rest of the scan completes; cached data for
 that market is marked `funding_refresh_failed` and cannot pass the monitoring gates.
 
-Paper matching adds a conservative cost model (10 bps perp/hedge fill, 5% annual borrow, 7-day
-hold) and requires an exact same-asset Coinbase or Kraken spot book with ≥5× notional depth and
-≥10% executable net APR. Equity perps (`xyz:*`) usually fail exact-spot matching and are not a
-24/7 delta-neutral arb when the cash market is shut. FX, session gaps, and your own market
-impact are still out of scope.
+Paper matching adds a conservative cost model (10 bps perp fill, each venue's base taker fee,
+5% annual financing, and a 7-day hold) and requires an exact same-asset OKX, Binance, Coinbase,
+or Kraken spot book with ≥5× notional depth and ≥10% executable net APR. The dashboard also
+shows 14- and 30-day net-APR sensitivity, but approval remains gated by the 7-day case. OKX and
+Binance prefer USDC books, then USDT; stablecoin basis/depeg risk is not modeled. Equity perps
+(`xyz:*`) usually fail exact-spot matching and are not a 24/7 delta-neutral arb when the cash
+market is shut. FX, session gaps, and your own market impact are still out of scope.
 
 ## Run locally
 
@@ -56,7 +58,7 @@ Paper positions are accounting entries only; they never create exchange orders o
 The default notional is $1,000. Preferred flow is approval-gated matching against public spot books:
 
 ```bash
-# Match eligible candidates to Coinbase/Kraken exact-asset books; persists rejection reasons.
+# Match eligible candidates to OKX/Binance/Coinbase/Kraken exact-asset books.
 funding-arb-monitor paper recommend
 
 # Requote both legs, recheck gates/depth/net APR, then atomically open the simulated pair.

@@ -6,7 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Protocol
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,12 @@ class HedgeQuote:
     def exit_cost_bps(self) -> float:
         slippage_bps = (1 - self.executable_sell_price / self.mid) * 10_000
         return self.fee_bps + max(slippage_bps, self.spread_bps / 2)
+
+
+class SpotVenue(Protocol):
+    name: str
+
+    def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None: ...
 
 
 class PublicJsonClient:
@@ -181,6 +187,125 @@ class KrakenSpot:
             return None
         bids, asks = book.get("bids", []), book.get("asks", [])
         if not bids or not asks:
+            return None
+        buy = _average_price(asks, notional_usd)
+        sell = _average_price(bids, notional_usd)
+        if buy is None or sell is None:
+            return None
+        return HedgeQuote(
+            venue=self.name,
+            symbol=symbol,
+            asset=asset,
+            bid=float(bids[0][0]),
+            ask=float(asks[0][0]),
+            executable_buy_price=buy,
+            executable_sell_price=sell,
+            bid_depth_usd=_depth_usd(bids),
+            ask_depth_usd=_depth_usd(asks),
+            fee_bps=self.fee_bps,
+            captured_at_ms=int(time.time() * 1000),
+        )
+
+
+class OkxSpot:
+    name = "okx"
+    fee_bps = 10.0
+    base_url = "https://www.okx.com/api/v5"
+
+    def __init__(self, get_json: Callable[[str], object] | None = None) -> None:
+        self.get_json = get_json or PublicJsonClient().get
+        self._instruments: object | None = None
+
+    def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None:
+        if self._instruments is None:
+            self._instruments = self.get_json(
+                f"{self.base_url}/public/instruments?instType=SPOT"
+            )
+        payload = self._instruments
+        instruments = payload.get("data", []) if isinstance(payload, dict) else []
+        matches = [
+            instrument
+            for instrument in instruments
+            if isinstance(instrument, dict)
+            and instrument.get("baseCcy") == asset
+            and instrument.get("quoteCcy") in {"USDC", "USDT"}
+            and instrument.get("state") == "live"
+        ]
+        if not matches:
+            return None
+        instrument = sorted(matches, key=lambda item: item["quoteCcy"] != "USDC")[0]
+        symbol = str(instrument["instId"])
+        query = urllib.parse.urlencode({"instId": symbol, "sz": 400})
+        depth_payload = self.get_json(f"{self.base_url}/market/books?{query}")
+        books = depth_payload.get("data", []) if isinstance(depth_payload, dict) else []
+        book = books[0] if books else None
+        return self._quote_from_book(asset, symbol, book, notional_usd)
+
+    def _quote_from_book(
+        self, asset: str, symbol: str, book: object, notional_usd: float
+    ) -> HedgeQuote | None:
+        if not isinstance(book, dict):
+            return None
+        bids, asks = book.get("bids", []), book.get("asks", [])
+        if not isinstance(bids, list) or not isinstance(asks, list) or not bids or not asks:
+            return None
+        buy = _average_price(asks, notional_usd)
+        sell = _average_price(bids, notional_usd)
+        if buy is None or sell is None:
+            return None
+        return HedgeQuote(
+            venue=self.name,
+            symbol=symbol,
+            asset=asset,
+            bid=float(bids[0][0]),
+            ask=float(asks[0][0]),
+            executable_buy_price=buy,
+            executable_sell_price=sell,
+            bid_depth_usd=_depth_usd(bids),
+            ask_depth_usd=_depth_usd(asks),
+            fee_bps=self.fee_bps,
+            captured_at_ms=int(time.time() * 1000),
+        )
+
+
+class BinanceSpot:
+    name = "binance"
+    fee_bps = 10.0
+    base_url = "https://api.binance.com/api/v3"
+
+    def __init__(self, get_json: Callable[[str], object] | None = None) -> None:
+        self.get_json = get_json or PublicJsonClient().get
+        self._exchange_info: object | None = None
+
+    def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None:
+        if self._exchange_info is None:
+            self._exchange_info = self.get_json(f"{self.base_url}/exchangeInfo")
+        payload = self._exchange_info
+        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
+        matches = [
+            symbol
+            for symbol in symbols
+            if isinstance(symbol, dict)
+            and symbol.get("baseAsset") == asset
+            and symbol.get("quoteAsset") in {"USDC", "USDT"}
+            and symbol.get("status") == "TRADING"
+            and bool(symbol.get("isSpotTradingAllowed", True))
+        ]
+        if not matches:
+            return None
+        market = sorted(matches, key=lambda item: item["quoteAsset"] != "USDC")[0]
+        symbol = str(market["symbol"])
+        query = urllib.parse.urlencode({"symbol": symbol, "limit": 500})
+        book = self.get_json(f"{self.base_url}/depth?{query}")
+        return self._quote_from_book(asset, symbol, book, notional_usd)
+
+    def _quote_from_book(
+        self, asset: str, symbol: str, book: object, notional_usd: float
+    ) -> HedgeQuote | None:
+        if not isinstance(book, dict):
+            return None
+        bids, asks = book.get("bids", []), book.get("asks", [])
+        if not isinstance(bids, list) or not isinstance(asks, list) or not bids or not asks:
             return None
         buy = _average_price(asks, notional_usd)
         sell = _average_price(bids, notional_usd)

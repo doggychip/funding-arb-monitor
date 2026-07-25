@@ -7,14 +7,21 @@ from datetime import datetime
 from .costs import CostAssumptions
 from .hyperliquid import HyperliquidClient
 from .store import Store
-from .venues import CoinbaseSpot, HedgeQuote, KrakenSpot
+from .venues import (
+    BinanceSpot,
+    CoinbaseSpot,
+    HedgeQuote,
+    KrakenSpot,
+    OkxSpot,
+    SpotVenue,
+)
 
 
 class PaperMatcher:
     def __init__(
         self,
         store: Store,
-        venues: Iterable[CoinbaseSpot | KrakenSpot] | None = None,
+        venues: Iterable[SpotVenue] | None = None,
         perp_client: HyperliquidClient | None = None,
         *,
         notional_usd: float = 1_000,
@@ -24,7 +31,9 @@ class PaperMatcher:
         max_snapshot_age_seconds: int = 15 * 60,
     ) -> None:
         self.store = store
-        self.venues = list(venues or [CoinbaseSpot(), KrakenSpot()])
+        self.venues = list(
+            venues or [OkxSpot(), BinanceSpot(), CoinbaseSpot(), KrakenSpot()]
+        )
         self.perp_client = perp_client or HyperliquidClient()
         self.notional_usd = notional_usd
         self.min_depth_multiple = min_depth_multiple
@@ -56,11 +65,20 @@ class PaperMatcher:
                     coin,
                     "net_carry_below_threshold",
                     f"executable net APR {net_apr:.1f}% < {self.min_net_apr_pct:.1f}%",
+                    quote=quote,
+                    gross_apr=gross_apr,
                 )
                 continue
             snapshot = self.store.latest_market_snapshot(coin)
             if snapshot is None:
-                self._record_check(analyzed_at, coin, "missing_perp_snapshot", "no current perp mark")
+                self._record_check(
+                    analyzed_at,
+                    coin,
+                    "missing_perp_snapshot",
+                    "no current perp mark",
+                    quote=quote,
+                    gross_apr=gross_apr,
+                )
                 continue
             captured_at = datetime.fromisoformat(str(snapshot["captured_at"])).timestamp()
             if time.time() - captured_at > self.max_snapshot_age_seconds:
@@ -69,6 +87,8 @@ class PaperMatcher:
                     coin,
                     "stale_perp_snapshot",
                     f"perp snapshot is older than {self.max_snapshot_age_seconds // 60} minutes",
+                    quote=quote,
+                    gross_apr=gross_apr,
                 )
                 continue
             now_ms = int(time.time() * 1000)
@@ -91,6 +111,8 @@ class PaperMatcher:
                 coin,
                 "pending_approval",
                 f"{quote.venue} {quote.symbol}; executable net APR {net_apr:.1f}%",
+                quote=quote,
+                gross_apr=gross_apr,
             )
         return created
 
@@ -149,12 +171,18 @@ class PaperMatcher:
             raise RuntimeError("approved paper position was not persisted")
         return position
 
-    def _net_apr(self, gross_apr: float, quote: HedgeQuote) -> float:
+    def _net_apr(
+        self, gross_apr: float, quote: HedgeQuote, holding_days: int | None = None
+    ) -> float:
         total_round_trip_bps = (
             self.perp_fee_bps * 2 + quote.entry_cost_bps + quote.exit_cost_bps
         )
         annualized_cost_pct = (
-            total_round_trip_bps / 10_000 * 365 / self.costs.holding_days * 100
+            total_round_trip_bps
+            / 10_000
+            * 365
+            / (holding_days or self.costs.holding_days)
+            * 100
         )
         return gross_apr - annualized_cost_pct - self.costs.annual_borrow_pct
 
@@ -211,12 +239,38 @@ class PaperMatcher:
             return None, "all_spot_venues_unavailable"
         return None, "no_exact_spot_market"
 
-    def _record_check(self, analyzed_at: str, coin: str, status: str, detail: str) -> None:
+    def _record_check(
+        self,
+        analyzed_at: str,
+        coin: str,
+        status: str,
+        detail: str,
+        *,
+        quote: HedgeQuote | None = None,
+        gross_apr: float | None = None,
+    ) -> None:
         self.store.save_paper_match_check(
             candidate_analyzed_at=analyzed_at,
             coin=coin,
             status=status,
             detail=detail,
+            hedge_venue=quote.venue if quote else None,
+            hedge_symbol=quote.symbol if quote else None,
+            net_apr_7d_pct=(
+                self._net_apr(gross_apr, quote, 7)
+                if quote is not None and gross_apr is not None
+                else None
+            ),
+            net_apr_14d_pct=(
+                self._net_apr(gross_apr, quote, 14)
+                if quote is not None and gross_apr is not None
+                else None
+            ),
+            net_apr_30d_pct=(
+                self._net_apr(gross_apr, quote, 30)
+                if quote is not None and gross_apr is not None
+                else None
+            ),
         )
 
     @staticmethod

@@ -6,7 +6,7 @@ from datetime import datetime
 from .costs import CostAssumptions
 from .models import FundingPoint
 from .store import Store
-from .venues import CoinbaseSpot, KrakenSpot
+from .venues import BinanceSpot, CoinbaseSpot, KrakenSpot, OkxSpot
 
 
 class PaperPositionTracker:
@@ -19,7 +19,12 @@ class PaperPositionTracker:
         max_snapshot_age_seconds: int = 15 * 60,
     ) -> None:
         self.store = store
-        self.venues = {"coinbase": CoinbaseSpot(), "kraken": KrakenSpot()}
+        self.venues = {
+            "okx": OkxSpot(),
+            "binance": BinanceSpot(),
+            "coinbase": CoinbaseSpot(),
+            "kraken": KrakenSpot(),
+        }
         self.max_hedge_drift_pct = max_hedge_drift_pct
         self.max_holding_days = max_holding_days
         self.max_snapshot_age_seconds = max_snapshot_age_seconds

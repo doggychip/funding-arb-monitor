@@ -134,6 +134,11 @@ class Store:
             )
             self._ensure_column(connection, "paper_positions", "exit_cost_usd", "REAL")
             self._ensure_column(connection, "paper_positions", "exit_reason", "TEXT")
+            self._ensure_column(connection, "paper_match_checks", "hedge_venue", "TEXT")
+            self._ensure_column(connection, "paper_match_checks", "hedge_symbol", "TEXT")
+            self._ensure_column(connection, "paper_match_checks", "net_apr_7d_pct", "REAL")
+            self._ensure_column(connection, "paper_match_checks", "net_apr_14d_pct", "REAL")
+            self._ensure_column(connection, "paper_match_checks", "net_apr_30d_pct", "REAL")
 
     @staticmethod
     def _ensure_column(
@@ -459,14 +464,42 @@ class Store:
         coin: str,
         status: str,
         detail: str,
+        hedge_venue: str | None = None,
+        hedge_symbol: str | None = None,
+        net_apr_7d_pct: float | None = None,
+        net_apr_14d_pct: float | None = None,
+        net_apr_30d_pct: float | None = None,
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO paper_match_checks
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO paper_match_checks (
+                    candidate_analyzed_at, coin, checked_at_ms, status, detail,
+                    hedge_venue, hedge_symbol, net_apr_7d_pct,
+                    net_apr_14d_pct, net_apr_30d_pct
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_analyzed_at, coin) DO UPDATE SET
+                    checked_at_ms = excluded.checked_at_ms,
+                    status = excluded.status,
+                    detail = excluded.detail,
+                    hedge_venue = excluded.hedge_venue,
+                    hedge_symbol = excluded.hedge_symbol,
+                    net_apr_7d_pct = excluded.net_apr_7d_pct,
+                    net_apr_14d_pct = excluded.net_apr_14d_pct,
+                    net_apr_30d_pct = excluded.net_apr_30d_pct
                 """,
-                (candidate_analyzed_at, coin, int(time.time() * 1000), status, detail),
+                (
+                    candidate_analyzed_at,
+                    coin,
+                    int(time.time() * 1000),
+                    status,
+                    detail,
+                    hedge_venue,
+                    hedge_symbol,
+                    net_apr_7d_pct,
+                    net_apr_14d_pct,
+                    net_apr_30d_pct,
+                ),
             )
 
     def latest_paper_match_checks(self) -> list[dict[str, object]]:

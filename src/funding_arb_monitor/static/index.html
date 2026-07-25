@@ -125,7 +125,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Market</th><th>Structure</th><th>Gross APR</th><th>Hedge</th><th>Executable net APR</th><th>Match result</th><th>Proposed action</th></tr>
+              <tr><th>Market</th><th>Gross APR</th><th>Best hedge</th><th>7d net APR</th><th>14d net APR</th><th>30d net APR</th><th>Match result</th><th>Proposed action</th></tr>
             </thead>
             <tbody id="recommendation-rows"></tbody>
           </table>
@@ -232,9 +232,15 @@
       const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
       const ideas = candidates.filter((item) => item.eligible);
 
-      const proposedAction = (status, recommendation) => {
+      const proposedAction = (status, recommendation, check) => {
         if (recommendation) {
           return `<button type="button" data-approve="${recommendation.id}">Approve $${recommendation.notional_usd.toFixed(0)} paper pair</button>`;
+        }
+        if ((check?.net_apr_14d_pct ?? -Infinity) >= 10) {
+          return "Watch; qualifies only if carry persists for 14 days";
+        }
+        if ((check?.net_apr_30d_pct ?? -Infinity) >= 10) {
+          return "Watch; qualifies only near a 30-day hold";
         }
         return escapeHtml(({
           no_exact_spot_market: "Monitor only; wait for an exact spot listing",
@@ -252,19 +258,23 @@
         const recommendation = pendingByCoin.get(candidate.coin);
         const check = checksByCoin.get(candidate.coin);
         const status = check?.status || (recommendation ? "pending_approval" : "not_checked");
-        const hedge = recommendation
-          ? `${recommendation.venue} · ${recommendation.hedge_symbol}`
+        const hedgeVenue = recommendation?.venue || check?.hedge_venue;
+        const hedgeSymbol = recommendation?.hedge_symbol || check?.hedge_symbol;
+        const hedge = hedgeVenue
+          ? `${hedgeVenue} · ${hedgeSymbol}`
           : "No executable hedge";
         const result = check?.detail || status.replaceAll("_", " ");
+        const net7d = recommendation?.executable_net_apr_pct ?? check?.net_apr_7d_pct;
         return `
         <tr>
           <td>${escapeHtml(candidate.coin)}</td>
-          <td>${escapeHtml(candidate.side.replaceAll("_", " "))}</td>
           <td class="${numberClass(candidate.realized_7d_apr_pct)}">${percent(candidate.realized_7d_apr_pct)}</td>
           <td>${escapeHtml(hedge)}</td>
-          <td class="${numberClass(recommendation?.executable_net_apr_pct ?? 0)}">${percent(recommendation?.executable_net_apr_pct)}</td>
+          <td class="${numberClass(net7d ?? 0)}">${percent(net7d)}</td>
+          <td class="${numberClass(check?.net_apr_14d_pct ?? 0)}">${percent(check?.net_apr_14d_pct)}</td>
+          <td class="${numberClass(check?.net_apr_30d_pct ?? 0)}">${percent(check?.net_apr_30d_pct)}</td>
           <td><span class="badge ${recommendation ? "eligible" : "review"}">${escapeHtml(result)}</span></td>
-          <td>${proposedAction(status, recommendation)}</td>
+          <td>${proposedAction(status, recommendation, check)}</td>
         </tr>
       `}).join("");
       document.querySelector("#recommendation-empty").style.display = ideas.length ? "none" : "block";

@@ -94,6 +94,11 @@ def test_matcher_requires_approval_before_opening_position(tmp_path) -> None:
 
     assert len(recommendations) == 1
     assert recommendations[0]["executable_net_apr_pct"] == pytest.approx(163.7142857)
+    check = store.latest_paper_match_checks()[0]
+    assert check["hedge_venue"] == "coinbase"
+    assert check["net_apr_7d_pct"] == pytest.approx(163.7142857)
+    assert check["net_apr_14d_pct"] == pytest.approx(179.3571429)
+    assert check["net_apr_30d_pct"] == pytest.approx(187.7)
     assert store.open_paper_positions() == []
     recommendation_id = recommendations[0]["id"]
 
