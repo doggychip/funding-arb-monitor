@@ -50,16 +50,21 @@ http://127.0.0.1:8080/docs.
 
 Useful endpoints: `GET /healthz`, `GET /api/status`, `GET /api/candidates`,
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
-`GET /api/paper/report`, and `POST /api/paper/recommendations/{id}/approve`.
+`GET /api/paper/report`, `GET /api/paper/performance`, and
+`POST /api/paper/recommendations/{id}/approve`.
 
 ## Paper positions
 
 Paper positions are accounting entries only; they never create exchange orders or use credentials.
-The default notional is $1,000. Preferred flow is approval-gated matching against public spot books:
+The default notional is $1,000, with at most three concurrent positions. The Zeabur scheduler
+uses shadow mode to auto-open qualified simulations; manual approval remains available:
 
 ```bash
 # Match eligible candidates to OKX/Binance/Coinbase/Kraken exact-asset books.
 funding-arb-monitor paper recommend
+
+# Or automatically open every qualified result as a simulated position only.
+funding-arb-monitor paper shadow
 
 # Requote both legs, recheck gates/depth/net APR, then atomically open the simulated pair.
 # The command rejects deteriorated or expired recommendations.
@@ -105,7 +110,7 @@ Hourly host cron (times are local):
 
 ```cron
 5 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor scan --days 30 --min-oi 1000000 >> data/scanner.log 2>&1
-7 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper recommend >> data/scanner.log 2>&1
+7 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper shadow >> data/scanner.log 2>&1
 10 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper accrue >> data/scanner.log 2>&1
 12 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper update >> data/scanner.log 2>&1
 15 17 * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper report >> data/paper-report.log 2>&1

@@ -30,6 +30,9 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert checks[0]["status"] == "no_exact_spot_market"
     assert checks[0]["detail"] == "no exact spot market"
     assert client.get("/api/paper/positions").json() == []
+    performance = client.get("/api/paper/performance").json()
+    assert performance["completed_trades"] == 0
+    assert performance["win_rate_pct"] is None
 
 
 def test_approval_token_protects_public_mutation(tmp_path, monkeypatch) -> None:

@@ -358,6 +358,7 @@ class Store:
         *,
         max_open_positions: int,
         execution: dict[str, object],
+        approval_mode: str = "manual",
     ) -> int:
         now_ms = int(time.time() * 1000)
         with self.connect() as connection:
@@ -439,7 +440,11 @@ class Store:
                     recommendation["notional_usd"],
                     recommendation["entry_cost_usd"],
                     "exact_spot_market_matched_from_public_order_book",
-                    "Opened from an approval-gated public-order-book recommendation.",
+                    (
+                        "Auto-opened by the shadow paper scheduler."
+                        if approval_mode == "shadow_auto"
+                        else "Opened from an approval-gated public-order-book recommendation."
+                    ),
                     now_ms,
                     recommendation_id,
                     recommendation["perp_entry_price"],
@@ -751,6 +756,50 @@ class Store:
             "estimated_entry_cost_usd": sum(float(item["entry_cost_usd"]) for item in positions),
             "financing_cost_usd": sum(float(item["financing_cost_usd"]) for item in positions),
             "net_pnl_usd": sum(float(item["net_pnl_usd"]) for item in positions),
+        }
+
+    def paper_performance(self) -> dict[str, object]:
+        positions = self.paper_positions()
+        closed = sorted(
+            (item for item in positions if item["closed_at_ms"] is not None),
+            key=lambda item: int(item["closed_at_ms"]),
+        )
+        open_positions = [item for item in positions if item["closed_at_ms"] is None]
+        wins = sum(float(item["net_pnl_usd"]) > 0 for item in closed)
+        cumulative_pnl = 0.0
+        peak_pnl = 0.0
+        max_drawdown = 0.0
+        for item in closed:
+            cumulative_pnl += float(item["net_pnl_usd"])
+            peak_pnl = max(peak_pnl, cumulative_pnl)
+            max_drawdown = max(max_drawdown, peak_pnl - cumulative_pnl)
+        exit_reasons: dict[str, int] = {}
+        for item in closed:
+            reason = str(item.get("exit_reason") or "unspecified")
+            exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
+        holding_hours = [
+            (int(item["closed_at_ms"]) - int(item["opened_at_ms"])) / 3_600_000
+            for item in closed
+        ]
+        return {
+            "completed_trades": len(closed),
+            "winning_trades": wins,
+            "win_rate_pct": wins / len(closed) * 100 if closed else None,
+            "realized_net_pnl_usd": sum(float(item["net_pnl_usd"]) for item in closed),
+            "average_net_pnl_usd": (
+                sum(float(item["net_pnl_usd"]) for item in closed) / len(closed)
+                if closed
+                else None
+            ),
+            "max_drawdown_usd": max_drawdown,
+            "average_holding_hours": (
+                sum(holding_hours) / len(holding_hours) if holding_hours else None
+            ),
+            "open_positions": len(open_positions),
+            "open_net_pnl_usd": sum(
+                float(item["net_pnl_usd"]) for item in open_positions
+            ),
+            "exit_reasons": exit_reasons,
         }
 
     @staticmethod

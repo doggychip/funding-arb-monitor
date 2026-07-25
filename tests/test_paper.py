@@ -50,3 +50,55 @@ def test_closed_position_remains_in_report_with_financing_cost(tmp_path) -> None
     assert summary["closed_positions"] == 1
     assert summary["financing_cost_usd"] == pytest.approx(50, abs=0.01)
     assert len(store.paper_positions()) == 1
+
+
+def test_paper_performance_summarizes_closed_trades(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    position_ids = [
+        store.open_paper_position(
+            coin=coin,
+            hedge_venue="test",
+            side="short_perp_long_hedge",
+            notional_usd=1_000,
+            entry_cost_usd=0,
+            hedge_assessment="test",
+            notes="test",
+        )
+        for coin in ("WIN", "LOSS")
+    ]
+    now_ms = int(time.time() * 1000)
+    store.save_paper_accruals(position_ids[0], [(now_ms, 10)])
+    store.save_paper_accruals(position_ids[1], [(now_ms, -5)])
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE paper_positions
+            SET opened_at_ms = ?, closed_at_ms = ?, exit_reason = 'maximum_7d_holding_period',
+                exit_cost_usd = 0
+            WHERE id = ?
+            """,
+            (now_ms - 4 * 3_600_000, now_ms - 3 * 3_600_000, position_ids[0]),
+        )
+        connection.execute(
+            """
+            UPDATE paper_positions
+            SET opened_at_ms = ?, closed_at_ms = ?, exit_reason = 'funding_flipped_for_3_hours',
+                exit_cost_usd = 0
+            WHERE id = ?
+            """,
+            (now_ms - 2 * 3_600_000, now_ms - 3_600_000, position_ids[1]),
+        )
+
+    performance = store.paper_performance()
+
+    assert performance["completed_trades"] == 2
+    assert performance["winning_trades"] == 1
+    assert performance["win_rate_pct"] == 50
+    assert performance["realized_net_pnl_usd"] == pytest.approx(5, abs=0.02)
+    assert performance["max_drawdown_usd"] == pytest.approx(5, abs=0.02)
+    assert performance["average_holding_hours"] == 1
+    assert performance["exit_reasons"] == {
+        "maximum_7d_holding_period": 1,
+        "funding_flipped_for_3_hours": 1,
+    }

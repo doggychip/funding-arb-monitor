@@ -139,3 +139,22 @@ def test_approval_rejects_deteriorated_spot_depth(tmp_path) -> None:
 
     assert store.open_paper_positions() == []
     assert store.paper_recommendation(recommendation_id)["status"] == "pending"
+
+
+def test_shadow_workflow_auto_opens_simulated_position(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    seed_candidate(store)
+    matcher = PaperMatcher(
+        store,
+        venues=[FakeVenue()],  # type: ignore[list-item]
+        perp_client=FakePerpClient(),  # type: ignore[arg-type]
+    )
+
+    result = matcher.shadow()
+
+    assert result["recommendations"] == 1
+    assert len(result["opened"]) == 1
+    assert result["rejected"] == []
+    position = store.open_paper_positions()[0]
+    assert position["notes"] == "Auto-opened by the shadow paper scheduler."

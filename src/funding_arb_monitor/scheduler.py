@@ -19,7 +19,7 @@ class ScheduledJob:
 
 JOBS = (
     ScheduledJob("scan", 5, ("scan", "--days", "30", "--min-oi", "1000000")),
-    ScheduledJob("recommend", 7, ("paper", "recommend")),
+    ScheduledJob("shadow", 7, ("paper", "shadow")),
     ScheduledJob("accrue", 10, ("paper", "accrue")),
     ScheduledJob("update", 12, ("paper", "update")),
     ScheduledJob("report", 15, ("paper", "report"), hour=17),

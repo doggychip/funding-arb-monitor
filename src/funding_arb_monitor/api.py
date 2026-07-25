@@ -89,6 +89,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def paper_report() -> dict[str, object]:
         return store.paper_summary()
 
+    @app.get("/api/paper/performance")
+    def paper_performance() -> dict[str, object]:
+        return store.paper_performance()
+
     return app
 
 

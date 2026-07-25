@@ -116,7 +116,25 @@ class PaperMatcher:
             )
         return created
 
-    def approve(self, recommendation_id: int) -> dict[str, object]:
+    def shadow(self) -> dict[str, object]:
+        opened: list[dict[str, object]] = []
+        rejected: list[dict[str, object]] = []
+        recommendations = self.recommend()
+        for recommendation in recommendations:
+            recommendation_id = int(recommendation["id"])
+            try:
+                opened.append(self.approve(recommendation_id, approval_mode="shadow_auto"))
+            except ValueError as exc:
+                rejected.append({"id": recommendation_id, "reason": str(exc)})
+        return {
+            "recommendations": len(recommendations),
+            "opened": opened,
+            "rejected": rejected,
+        }
+
+    def approve(
+        self, recommendation_id: int, *, approval_mode: str = "manual"
+    ) -> dict[str, object]:
         recommendation = self.store.paper_recommendation(recommendation_id)
         if recommendation is None:
             raise ValueError("recommendation not found")
@@ -165,6 +183,7 @@ class PaperMatcher:
             recommendation_id,
             max_open_positions=self.max_open_positions,
             execution=execution,
+            approval_mode=approval_mode,
         )
         position = self.store.paper_position(position_id)
         if position is None:

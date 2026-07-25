@@ -50,6 +50,9 @@ def parser() -> argparse.ArgumentParser:
     paper_commands.add_parser(
         "recommend", help="match eligible candidates to public spot books for approval"
     )
+    paper_commands.add_parser(
+        "shadow", help="auto-open qualified recommendations as simulated positions only"
+    )
     approve = paper_commands.add_parser("approve", help="approve one unexpired paper recommendation")
     approve.add_argument("--id", type=int, required=True)
     paper_commands.add_parser("update", help="mark paired positions and apply conservative exits")
@@ -99,6 +102,9 @@ def main() -> None:
         if args.paper_command == "recommend":
             recommendations = PaperMatcher(store).recommend()
             print(json.dumps(recommendations, indent=2))
+            return
+        if args.paper_command == "shadow":
+            print(json.dumps(PaperMatcher(store).shadow(), indent=2))
             return
         if args.paper_command == "approve":
             print(json.dumps(PaperMatcher(store).approve(args.id), indent=2))

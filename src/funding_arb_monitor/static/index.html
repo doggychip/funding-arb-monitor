@@ -134,6 +134,17 @@
       </div>
     </section>
     <section style="margin-top: 20px">
+      <h2>Shadow paper performance</h2>
+      <p class="subtle">Qualified trades are opened automatically as simulations only, capped at three concurrent positions. No exchange credentials or orders are used.</p>
+      <div class="stats" style="margin-top: 10px">
+        <div class="stat"><div class="value" id="completed-trades">—</div><div class="label">Completed trades</div></div>
+        <div class="stat"><div class="value" id="paper-win-rate">—</div><div class="label">Win rate</div></div>
+        <div class="stat"><div class="value" id="realized-paper-pnl">—</div><div class="label">Realized net P&amp;L</div></div>
+        <div class="stat"><div class="value negative" id="paper-drawdown">—</div><div class="label">Maximum drawdown</div></div>
+      </div>
+      <div id="performance-detail" class="notice"></div>
+    </section>
+    <section style="margin-top: 20px">
       <h2>Paper positions</h2>
       <p class="subtle">Simulated paired hedges only. Funding accrues from public history; marks, drift, and conservative exits update via <code>paper update</code>.</p>
       <div class="panel">
@@ -213,6 +224,7 @@
           : "No persisted scan yet";
         render();
         await loadRecommendations();
+        await loadPerformance();
         await loadPaper();
       } catch (error) {
         meta.textContent = "Could not load candidates. Confirm the API is running.";
@@ -296,6 +308,28 @@
         </tr>
       `).join("");
       document.querySelector("#paper-empty").style.display = positions.length ? "none" : "block";
+    }
+
+    async function loadPerformance() {
+      const response = await fetch("/api/paper/performance");
+      if (!response.ok) return;
+      const performance = await response.json();
+      document.querySelector("#completed-trades").textContent = performance.completed_trades;
+      document.querySelector("#paper-win-rate").textContent = performance.win_rate_pct == null
+        ? "—"
+        : `${performance.win_rate_pct.toFixed(1)}%`;
+      const realized = document.querySelector("#realized-paper-pnl");
+      realized.textContent = money.format(performance.realized_net_pnl_usd);
+      realized.className = `value ${numberClass(performance.realized_net_pnl_usd)}`;
+      document.querySelector("#paper-drawdown").textContent = money.format(performance.max_drawdown_usd);
+      const reasons = Object.entries(performance.exit_reasons)
+        .map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${count}`)
+        .join(" · ");
+      const averageHold = performance.average_holding_hours == null
+        ? "—"
+        : `${performance.average_holding_hours.toFixed(1)}h`;
+      document.querySelector("#performance-detail").textContent =
+        `Open positions: ${performance.open_positions} · Open net P&L: ${money.format(performance.open_net_pnl_usd)} · Average hold: ${averageHold}${reasons ? ` · Exits: ${reasons}` : ""}`;
     }
 
     document.querySelector("#refresh").addEventListener("click", load);
