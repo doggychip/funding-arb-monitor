@@ -100,6 +100,12 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def paper_performance() -> dict[str, object]:
         return store.paper_performance()
 
+    @app.get("/api/alerts/deliveries")
+    def alert_deliveries(
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> list[dict[str, object]]:
+        return store.alert_deliveries(limit)
+
     return app
 
 

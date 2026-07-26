@@ -52,7 +52,11 @@ class Scanner:
             return self._run(run_id)
         except Exception as exc:
             self.store.finish_scan_run(run_id, status="failed", error=str(exc))
-            send_discord_alert(render_scan_failure(exc))
+            send_discord_alert(
+                render_scan_failure(exc),
+                store=self.store,
+                event_type="scan_failed",
+            )
             raise
 
     def _run(self, run_id: int) -> list[Candidate]:

@@ -148,7 +148,7 @@ def test_shadow_workflow_auto_opens_simulated_position(tmp_path, monkeypatch) ->
     alerts = []
     monkeypatch.setattr(
         "funding_arb_monitor.matcher.send_discord_alert",
-        lambda message: alerts.append(message),
+        lambda message, **kwargs: alerts.append(message),
     )
     matcher = PaperMatcher(
         store,

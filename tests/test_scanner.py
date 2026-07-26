@@ -79,7 +79,7 @@ def test_scanner_alerts_on_full_scan_failure(tmp_path, monkeypatch) -> None:
     alerts = []
     monkeypatch.setattr(
         "funding_arb_monitor.scanner.send_discord_alert",
-        lambda message: alerts.append(message),
+        lambda message, **kwargs: alerts.append(message),
     )
     client = FakeClient()
     monkeypatch.setattr(client, "snapshots", lambda: [])

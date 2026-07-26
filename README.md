@@ -51,7 +51,7 @@ docs remain at http://127.0.0.1:8080/docs.
 Useful endpoints: `GET /healthz`, `GET /api/status`, `GET /api/candidates`,
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
 `GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
-`GET /api/paper/performance`, and
+`GET /api/paper/performance`, `GET /api/alerts/deliveries`, and
 `POST /api/paper/recommendations/{id}/approve`.
 
 ## Paper positions
@@ -74,11 +74,14 @@ funding-arb-monitor paper approve --id 1
 # Accrue public funding into open simulated positions; idempotent per funding hour.
 funding-arb-monitor paper accrue
 
-# Refresh hedge marks, drift, net-after-exit, and conservative exit flags.
+# Refresh hedge marks, liquidity, drift, net-after-exit, and conservative exit flags.
 funding-arb-monitor paper update
 
 # Summary of funding P&L, MTM, and costs.
 funding-arb-monitor paper report
+
+# Verify Discord delivery from the deployed runtime.
+funding-arb-monitor paper alert-test
 ```
 
 Manual open still exists if you already know the hedge venue:
@@ -94,6 +97,12 @@ Monitoring-eligible ≠ tradeable. `paper recommend` often returns `[]` when eli
 exact liquid spot hedge (for example `CASHCAT` or `xyz:PALLADIUM`). Those outcomes are stored as
 match checks (`no_exact_spot_market`, thin depth, net APR below threshold) and shown on the dashboard.
 
+Open positions generate a warning after one degraded-liquidity observation. They close only after
+three consecutive hourly observations with Hyperliquid 24h volume below $500,000 or public spot-book
+depth below 2x position notional. Simulated exits persist executable prices, spread, depth, quantity,
+and timestamp; open P&L remains labeled as estimated while closed P&L is labeled simulated-realized.
+Database initialization applies these additions idempotently without replacing existing history.
+
 ## Alerts
 
 Set `FUNDING_ARB_WEBHOOK_URL` to a webhook that accepts `{"text": "..."}` and add `--alert`:
@@ -105,15 +114,16 @@ funding-arb-monitor scan --alert
 
 Default alerts are dashboard/API only. No alert is sent when the variable is absent.
 
-For Discord notifications on shadow entries, position exits, and full scan failures, set a Discord
-channel webhook URL:
+For Discord notifications on shadow entries, liquidity warnings, position exits, scheduler failures,
+and the daily heartbeat, set a Discord channel webhook URL:
 
 ```bash
 export FUNDING_ARB_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 ```
 
 Webhook delivery failures do not interrupt scanning or position tracking. Messages suppress Discord
-mentions and never include exchange credentials.
+mentions and never include exchange credentials. Delivery retries and final outcomes are stored in
+SQLite and exposed through `GET /api/alerts/deliveries`.
 
 ## Scheduling
 
@@ -125,6 +135,7 @@ Hourly host cron (times are local):
 10 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper accrue >> data/scanner.log 2>&1
 12 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper update >> data/scanner.log 2>&1
 15 17 * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper report >> data/paper-report.log 2>&1
+16 17 * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper heartbeat >> data/scanner.log 2>&1
 ```
 
 The Docker image runs the API and the same schedule in one process by default. Override
@@ -152,8 +163,19 @@ Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
 The container honors Zeabur's `PORT` variable. Deleting or detaching the `/data` volume deletes
 the SQLite scan and paper-trading history.
 
+### Additive database migration
+
+Back up the `/data` volume before deployment. On startup, `Store.initialize()` creates the
+`paper_liquidity_checks` and `alert_deliveries` tables and adds nullable exit-execution columns to
+`paper_positions`. Existing rows and IDs are preserved. Verify `/healthz`, the current paper
+position, and `/api/alerts/deliveries` after deployment. Rolling back the application image is safe
+because the previous version ignores these additive tables and columns.
+
 ## Graduation criteria for live trading
 
 Do not add exchange keys until match checks show repeatable exact-asset hedges with positive
 executable net APR after costs, and paper positions survive conservative exits (net ≤ 0, funding
-flip, drift > 2%, or 7-day hold). Live execution should remain a separate, opt-in project boundary.
+flip, drift > 2%, three-hour liquidity deterioration, or 7-day hold). The dashboard requires at
+least 30 closed simulations and four observation weeks before marking the evidence eligible for a
+live-trading review. That status is evidence for review, not permission to trade. Live execution
+should remain a separate, opt-in project boundary.

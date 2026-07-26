@@ -120,6 +120,25 @@ class Store:
                     detail TEXT NOT NULL,
                     PRIMARY KEY (candidate_analyzed_at, coin)
                 );
+                CREATE TABLE IF NOT EXISTS paper_liquidity_checks (
+                    position_id INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    day_volume_usd REAL NOT NULL,
+                    bid_depth_usd REAL NOT NULL,
+                    ask_depth_usd REAL NOT NULL,
+                    degraded INTEGER NOT NULL,
+                    reasons TEXT NOT NULL,
+                    PRIMARY KEY (position_id, timestamp_ms),
+                    FOREIGN KEY (position_id) REFERENCES paper_positions(id)
+                );
+                CREATE TABLE IF NOT EXISTS alert_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    attempted_at_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    detail TEXT
+                );
                 """
             )
             self._ensure_column(connection, "paper_positions", "recommendation_id", "INTEGER")
@@ -134,6 +153,13 @@ class Store:
             )
             self._ensure_column(connection, "paper_positions", "exit_cost_usd", "REAL")
             self._ensure_column(connection, "paper_positions", "exit_reason", "TEXT")
+            self._ensure_column(connection, "paper_positions", "perp_exit_price", "REAL")
+            self._ensure_column(connection, "paper_positions", "hedge_exit_price", "REAL")
+            self._ensure_column(connection, "paper_positions", "exit_quantity", "REAL")
+            self._ensure_column(connection, "paper_positions", "exit_hedge_spread_bps", "REAL")
+            self._ensure_column(connection, "paper_positions", "exit_bid_depth_usd", "REAL")
+            self._ensure_column(connection, "paper_positions", "exit_ask_depth_usd", "REAL")
+            self._ensure_column(connection, "paper_positions", "exit_executed_at_ms", "INTEGER")
             self._ensure_column(connection, "paper_match_checks", "hedge_venue", "TEXT")
             self._ensure_column(connection, "paper_match_checks", "hedge_symbol", "TEXT")
             self._ensure_column(connection, "paper_match_checks", "net_apr_7d_pct", "REAL")
@@ -638,7 +664,17 @@ class Store:
                         SELECT m.hedge_drift_pct FROM paper_position_marks m
                         WHERE m.position_id = p.id
                         ORDER BY m.timestamp_ms DESC LIMIT 1
-                    ) AS hedge_drift_pct
+                    ) AS hedge_drift_pct,
+                    (
+                        SELECT l.degraded FROM paper_liquidity_checks l
+                        WHERE l.position_id = p.id
+                        ORDER BY l.timestamp_ms DESC LIMIT 1
+                    ) AS liquidity_degraded,
+                    (
+                        SELECT l.reasons FROM paper_liquidity_checks l
+                        WHERE l.position_id = p.id
+                        ORDER BY l.timestamp_ms DESC LIMIT 1
+                    ) AS liquidity_reasons
                 FROM paper_positions p
                 WHERE p.id = ?
                 """,
@@ -665,7 +701,17 @@ class Store:
                         SELECT m.hedge_drift_pct FROM paper_position_marks m
                         WHERE m.position_id = p.id
                         ORDER BY m.timestamp_ms DESC LIMIT 1
-                    ) AS hedge_drift_pct
+                    ) AS hedge_drift_pct,
+                    (
+                        SELECT l.degraded FROM paper_liquidity_checks l
+                        WHERE l.position_id = p.id
+                        ORDER BY l.timestamp_ms DESC LIMIT 1
+                    ) AS liquidity_degraded,
+                    (
+                        SELECT l.reasons FROM paper_liquidity_checks l
+                        WHERE l.position_id = p.id
+                        ORDER BY l.timestamp_ms DESC LIMIT 1
+                    ) AS liquidity_reasons
                 FROM paper_positions p
                 {"" if include_closed else "WHERE p.closed_at_ms IS NULL"}
                 ORDER BY p.opened_at_ms DESC
@@ -731,16 +777,136 @@ class Store:
                 ),
             )
 
-    def close_paper_position(self, position_id: int, *, reason: str, exit_cost_usd: float) -> None:
+    def save_paper_liquidity_check(
+        self,
+        position_id: int,
+        *,
+        timestamp_ms: int,
+        day_volume_usd: float,
+        bid_depth_usd: float,
+        ask_depth_usd: float,
+        reasons: list[str],
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO paper_liquidity_checks
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    position_id,
+                    timestamp_ms,
+                    day_volume_usd,
+                    bid_depth_usd,
+                    ask_depth_usd,
+                    int(bool(reasons)),
+                    ",".join(reasons),
+                ),
+            )
+
+    def liquidity_degradation_streak(self, position_id: int, limit: int = 3) -> int:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT timestamp_ms, degraded
+                FROM paper_liquidity_checks
+                WHERE position_id = ?
+                ORDER BY timestamp_ms DESC
+                LIMIT ?
+                """,
+                (position_id, limit),
+            ).fetchall()
+        streak = 0
+        previous_timestamp: int | None = None
+        for row in rows:
+            timestamp = int(row["timestamp_ms"])
+            if not bool(row["degraded"]):
+                break
+            if (
+                previous_timestamp is not None
+                and not 45 * 60_000 <= previous_timestamp - timestamp <= 75 * 60_000
+            ):
+                break
+            streak += 1
+            previous_timestamp = timestamp
+        return streak
+
+    def close_paper_position(
+        self,
+        position_id: int,
+        *,
+        reason: str,
+        exit_cost_usd: float,
+        executed_at_ms: int | None = None,
+        perp_exit_price: float | None = None,
+        hedge_exit_price: float | None = None,
+        exit_quantity: float | None = None,
+        exit_hedge_spread_bps: float | None = None,
+        exit_bid_depth_usd: float | None = None,
+        exit_ask_depth_usd: float | None = None,
+    ) -> None:
+        closed_at_ms = executed_at_ms or int(time.time() * 1000)
         with self.connect() as connection:
             connection.execute(
                 """
                 UPDATE paper_positions
-                SET closed_at_ms = ?, exit_reason = ?, exit_cost_usd = ?
+                SET closed_at_ms = ?, exit_reason = ?, exit_cost_usd = ?,
+                    perp_exit_price = ?, hedge_exit_price = ?, exit_quantity = ?,
+                    exit_hedge_spread_bps = ?, exit_bid_depth_usd = ?,
+                    exit_ask_depth_usd = ?, exit_executed_at_ms = ?
                 WHERE id = ? AND closed_at_ms IS NULL
                 """,
-                (int(time.time() * 1000), reason, exit_cost_usd, position_id),
+                (
+                    closed_at_ms,
+                    reason,
+                    exit_cost_usd,
+                    perp_exit_price,
+                    hedge_exit_price,
+                    exit_quantity,
+                    exit_hedge_spread_bps,
+                    exit_bid_depth_usd,
+                    exit_ask_depth_usd,
+                    closed_at_ms,
+                    position_id,
+                ),
             )
+
+    def save_alert_delivery(
+        self,
+        *,
+        event_type: str,
+        status: str,
+        attempts: int,
+        detail: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO alert_deliveries (
+                    event_type, attempted_at_ms, status, attempts, detail
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event_type,
+                    int(time.time() * 1000),
+                    status,
+                    attempts,
+                    detail[:500] if detail else None,
+                ),
+            )
+
+    def alert_deliveries(self, limit: int = 50) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, event_type, attempted_at_ms, status, attempts, detail
+                FROM alert_deliveries
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def paper_position_timeline(self, position_id: int) -> dict[str, object] | None:
         position = self.paper_position(position_id)
@@ -874,6 +1040,25 @@ class Store:
             (int(item["closed_at_ms"]) - int(item["opened_at_ms"])) / 3_600_000
             for item in closed
         ]
+        now_ms = int(time.time() * 1000)
+        observation_weeks = (
+            (
+                max(int(item["closed_at_ms"] or now_ms) for item in positions)
+                - min(int(item["opened_at_ms"]) for item in positions)
+            )
+            / (7 * 86_400_000)
+            if positions
+            else 0
+        )
+        graduation = {
+            "required_closed_trades": 30,
+            "required_observation_weeks": 4,
+            "closed_trades": len(closed),
+            "observation_weeks": observation_weeks,
+            "trade_progress_pct": min(len(closed) / 30 * 100, 100),
+            "time_progress_pct": min(observation_weeks / 4 * 100, 100),
+            "eligible_for_live_review": len(closed) >= 30 and observation_weeks >= 4,
+        }
         return {
             "completed_trades": len(closed),
             "winning_trades": wins,
@@ -893,6 +1078,7 @@ class Store:
                 float(item["net_pnl_usd"]) for item in open_positions
             ),
             "exit_reasons": exit_reasons,
+            "graduation": graduation,
         }
 
     @staticmethod
@@ -917,5 +1103,14 @@ class Store:
             - result["entry_cost_usd"]
             - exit_cost
             - result["financing_cost_usd"]
+        )
+        result["pnl_status"] = (
+            "simulated_realized" if result.get("closed_at_ms") else "estimated_after_exit"
+        )
+        result["exit_execution_complete"] = bool(
+            result.get("closed_at_ms")
+            and result.get("perp_exit_price") is not None
+            and result.get("hedge_exit_price") is not None
+            and result.get("exit_executed_at_ms") is not None
         )
         return result

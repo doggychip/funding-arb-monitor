@@ -98,6 +98,9 @@ def test_paper_performance_summarizes_closed_trades(tmp_path) -> None:
     assert performance["realized_net_pnl_usd"] == pytest.approx(5, abs=0.02)
     assert performance["max_drawdown_usd"] == pytest.approx(5, abs=0.02)
     assert performance["average_holding_hours"] == 1
+    assert performance["graduation"]["closed_trades"] == 2
+    assert performance["graduation"]["required_closed_trades"] == 30
+    assert performance["graduation"]["eligible_for_live_review"] is False
     assert performance["exit_reasons"] == {
         "maximum_7d_holding_period": 1,
         "funding_flipped_for_3_hours": 1,

@@ -129,7 +129,9 @@ class PaperMatcher:
                 send_discord_alert(
                     render_shadow_entry(
                         position, float(recommendation["executable_net_apr_pct"])
-                    )
+                    ),
+                    store=self.store,
+                    event_type="shadow_position_opened",
                 )
             except ValueError as exc:
                 rejected.append({"id": recommendation_id, "reason": str(exc)})

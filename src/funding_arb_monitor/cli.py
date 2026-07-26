@@ -5,7 +5,12 @@ import json
 import os
 from pathlib import Path
 
-from .alerts import render_alert, send_webhook
+from .alerts import (
+    render_alert,
+    render_daily_heartbeat,
+    send_discord_alert,
+    send_webhook,
+)
 from .api import create_app
 from .hyperliquid import HyperliquidClient
 from .matcher import PaperMatcher
@@ -57,6 +62,8 @@ def parser() -> argparse.ArgumentParser:
     approve.add_argument("--id", type=int, required=True)
     paper_commands.add_parser("update", help="mark paired positions and apply conservative exits")
     paper_commands.add_parser("report", help="print paper-position performance")
+    paper_commands.add_parser("heartbeat", help="send the daily Discord status heartbeat")
+    paper_commands.add_parser("alert-test", help="send a Discord configuration test")
     return command
 
 
@@ -111,6 +118,30 @@ def main() -> None:
             return
         if args.paper_command == "update":
             print(json.dumps(PaperPositionTracker(store).update(), indent=2))
+            return
+        if args.paper_command == "heartbeat":
+            delivered = send_discord_alert(
+                render_daily_heartbeat(
+                    store.latest_scan_run() or {"status": "never_run"},
+                    store.paper_performance(),
+                ),
+                store=store,
+                event_type="daily_heartbeat",
+            )
+            print(f"discord_heartbeat_delivered={delivered}")
+            if not delivered:
+                raise SystemExit(1)
+            return
+        if args.paper_command == "alert-test":
+            delivered = send_discord_alert(
+                "✅ **Funding monitor Discord test succeeded**\n"
+                "Zeabur can deliver operational alerts to this channel.",
+                store=store,
+                event_type="configuration_test",
+            )
+            print(f"discord_test_delivered={delivered}")
+            if not delivered:
+                raise SystemExit(1)
             return
         print(json.dumps({"summary": store.paper_summary(), "positions": store.paper_positions()}, indent=2))
         return

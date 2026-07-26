@@ -34,6 +34,8 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     performance = client.get("/api/paper/performance").json()
     assert performance["completed_trades"] == 0
     assert performance["win_rate_pct"] is None
+    assert performance["graduation"]["eligible_for_live_review"] is False
+    assert client.get("/api/alerts/deliveries").json() == []
 
 
 def test_approval_token_protects_public_mutation(tmp_path, monkeypatch) -> None:

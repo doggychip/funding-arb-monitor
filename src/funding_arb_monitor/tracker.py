@@ -3,7 +3,11 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from .alerts import render_shadow_exit, send_discord_alert
+from .alerts import (
+    render_liquidity_warning,
+    render_shadow_exit,
+    send_discord_alert,
+)
 from .costs import CostAssumptions
 from .models import FundingPoint
 from .store import Store
@@ -18,6 +22,8 @@ class PaperPositionTracker:
         max_hedge_drift_pct: float = 2,
         max_holding_days: int = 7,
         max_snapshot_age_seconds: int = 15 * 60,
+        min_day_volume_usd: float = 500_000,
+        min_depth_multiple: float = 2,
     ) -> None:
         self.store = store
         self.venues = {
@@ -29,6 +35,8 @@ class PaperPositionTracker:
         self.max_hedge_drift_pct = max_hedge_drift_pct
         self.max_holding_days = max_holding_days
         self.max_snapshot_age_seconds = max_snapshot_age_seconds
+        self.min_day_volume_usd = min_day_volume_usd
+        self.min_depth_multiple = min_depth_multiple
         self.costs = CostAssumptions()
         self.perp_fee_bps = self.costs.perp_fill_bps
 
@@ -76,6 +84,31 @@ class PaperPositionTracker:
                 hedge_drift_pct=drift,
             )
             updated += 1
+            liquidity_reasons: list[str] = []
+            if float(snapshot["day_volume_usd"]) < self.min_day_volume_usd:
+                liquidity_reasons.append("perp_day_volume_below_500k")
+            required_depth = float(position["notional_usd"]) * self.min_depth_multiple
+            if min(quote.bid_depth_usd, quote.ask_depth_usd) < required_depth:
+                liquidity_reasons.append("spot_depth_below_2x_notional")
+            self.store.save_paper_liquidity_check(
+                int(position["id"]),
+                timestamp_ms=quote.captured_at_ms,
+                day_volume_usd=float(snapshot["day_volume_usd"]),
+                bid_depth_usd=quote.bid_depth_usd,
+                ask_depth_usd=quote.ask_depth_usd,
+                reasons=liquidity_reasons,
+            )
+            liquidity_streak = self.store.liquidity_degradation_streak(
+                int(position["id"])
+            )
+            if liquidity_streak == 1:
+                send_discord_alert(
+                    render_liquidity_warning(
+                        position, liquidity_reasons, liquidity_streak
+                    ),
+                    store=self.store,
+                    event_type="position_liquidity_warning",
+                )
 
             candidate = self.store.latest_candidate(str(position["coin"]))
             executable_net_apr = None
@@ -89,7 +122,12 @@ class PaperPositionTracker:
                     - annualized_cost_pct
                     - self.costs.annual_borrow_pct
                 )
-            exit_reason = self._exit_reason(position, drift, executable_net_apr)
+            exit_reason = self._exit_reason(
+                position,
+                drift,
+                executable_net_apr,
+                liquidity_streak=liquidity_streak,
+            )
             if exit_reason:
                 exit_cost = float(position["notional_usd"]) * (
                     self.perp_fee_bps + quote.exit_cost_bps
@@ -98,10 +136,25 @@ class PaperPositionTracker:
                     int(position["id"]),
                     reason=exit_reason,
                     exit_cost_usd=exit_cost,
+                    executed_at_ms=quote.captured_at_ms,
+                    perp_exit_price=perp_price,
+                    hedge_exit_price=(
+                        quote.executable_sell_price
+                        if position["side"] == "short_perp_long_hedge"
+                        else quote.executable_buy_price
+                    ),
+                    exit_quantity=quantity,
+                    exit_hedge_spread_bps=quote.spread_bps,
+                    exit_bid_depth_usd=quote.bid_depth_usd,
+                    exit_ask_depth_usd=quote.ask_depth_usd,
                 )
                 closed_position = self.store.paper_position(int(position["id"]))
                 if closed_position is not None:
-                    send_discord_alert(render_shadow_exit(closed_position))
+                    send_discord_alert(
+                        render_shadow_exit(closed_position),
+                        store=self.store,
+                        event_type="shadow_position_closed",
+                    )
                 closed += 1
         return {"updated": updated, "closed": closed}
 
@@ -110,9 +163,13 @@ class PaperPositionTracker:
         position: dict[str, object],
         drift_pct: float,
         executable_net_apr_pct: float | None,
+        *,
+        liquidity_streak: int = 0,
     ) -> str | None:
         if drift_pct > self.max_hedge_drift_pct:
             return "hedge_drift_above_2pct"
+        if liquidity_streak >= 3:
+            return "liquidity_degraded_for_3_hours"
         if int(time.time() * 1000) - int(position["opened_at_ms"]) >= self.max_holding_days * 86_400_000:
             return "maximum_7d_holding_period"
         if executable_net_apr_pct is not None and executable_net_apr_pct <= 0:

@@ -158,7 +158,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Market</th><th>Hedge venue</th><th>Status</th><th>Notional</th><th>Funding P&L</th><th>Pair MTM</th><th>Drift</th><th>Net after exit</th><th>Timeline</th></tr>
+              <tr><th>Market</th><th>Hedge venue</th><th>Status</th><th>Notional</th><th>Funding P&L</th><th>Pair MTM</th><th>Drift</th><th>Net P&L status</th><th>Timeline</th></tr>
             </thead>
             <tbody id="paper-rows"></tbody>
           </table>
@@ -327,19 +327,26 @@
     async function loadPaper() {
       const response = await fetch("/api/paper/positions?include_closed=true");
       const positions = response.ok ? await response.json() : [];
-      document.querySelector("#paper-rows").innerHTML = positions.map((position) => `
+      document.querySelector("#paper-rows").innerHTML = positions.map((position) => {
+        const liquidityWarning = position.closed_at_ms == null && position.liquidity_degraded;
+        const status = position.closed_at_ms != null
+          ? position.exit_reason.replaceAll("_", " ")
+          : liquidityWarning
+            ? `Liquidity warning: ${position.liquidity_reasons.replaceAll("_", " ")}`
+            : "Open";
+        return `
         <tr>
           <td>${escapeHtml(position.coin)}</td>
           <td>${escapeHtml(position.hedge_venue)}</td>
-          <td><span class="badge ${position.closed_at_ms == null ? "eligible" : "review"}">${position.closed_at_ms == null ? "Open" : escapeHtml(position.exit_reason.replaceAll("_", " "))}</span></td>
+          <td><span class="badge ${position.closed_at_ms == null && !liquidityWarning ? "eligible" : "review"}">${escapeHtml(status)}</span></td>
           <td>${money.format(position.notional_usd)}</td>
           <td class="${numberClass(position.funding_pnl_usd)}">${money.format(position.funding_pnl_usd)}</td>
           <td class="${numberClass(position.mark_to_market_pnl_usd)}">${money.format(position.mark_to_market_pnl_usd)}</td>
           <td>${position.hedge_drift_pct == null ? "—" : `${position.hedge_drift_pct.toFixed(2)}%`}</td>
-          <td class="${numberClass(position.net_pnl_usd)}">${money.format(position.net_pnl_usd)}</td>
+          <td class="${numberClass(position.net_pnl_usd)}">${money.format(position.net_pnl_usd)} · ${escapeHtml(position.pnl_status.replaceAll("_", " "))}</td>
           <td><button type="button" data-timeline="${position.id}">View chart</button></td>
         </tr>
-      `).join("");
+      `}).join("");
       document.querySelector("#paper-empty").style.display = positions.length ? "none" : "block";
     }
 
@@ -426,8 +433,9 @@
       const averageHold = performance.average_holding_hours == null
         ? "—"
         : `${performance.average_holding_hours.toFixed(1)}h`;
+      const graduation = performance.graduation;
       document.querySelector("#performance-detail").textContent =
-        `Open positions: ${performance.open_positions} · Open net P&L: ${money.format(performance.open_net_pnl_usd)} · Average hold: ${averageHold}${reasons ? ` · Exits: ${reasons}` : ""}`;
+        `Open positions: ${performance.open_positions} · Open net P&L: ${money.format(performance.open_net_pnl_usd)} · Average hold: ${averageHold} · Live-review evidence: ${graduation.closed_trades}/${graduation.required_closed_trades} closed trades and ${graduation.observation_weeks.toFixed(1)}/${graduation.required_observation_weeks} weeks${reasons ? ` · Exits: ${reasons}` : ""}`;
     }
 
     document.querySelector("#refresh").addEventListener("click", load);
