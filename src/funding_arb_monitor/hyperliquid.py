@@ -5,6 +5,8 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from email.message import Message
+from typing import Callable
 
 from .models import FundingPoint, MarketSnapshot
 
@@ -12,9 +14,22 @@ from .models import FundingPoint, MarketSnapshot
 class HyperliquidClient:
     """Public, read-only Hyperliquid info API client. Never accepts credentials."""
 
-    def __init__(self, endpoint: str = "https://api.hyperliquid.xyz/info", timeout: int = 20) -> None:
+    def __init__(
+        self,
+        endpoint: str = "https://api.hyperliquid.xyz/info",
+        timeout: int = 20,
+        max_attempts: int = 4,
+        request_interval_seconds: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
+        self.max_attempts = max_attempts
+        self.request_interval_seconds = request_interval_seconds
+        self.sleep = sleep
+        self.monotonic = monotonic
+        self._last_request_at: float | None = None
 
     def post(self, payload: dict[str, object]) -> object:
         request = urllib.request.Request(
@@ -22,14 +37,44 @@ class HyperliquidClient:
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "User-Agent": "funding-arb-monitor/0.1"},
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")[:300]
-            raise RuntimeError(f"Hyperliquid HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Hyperliquid request failed: {exc.reason}") from exc
+        for attempt in range(self.max_attempts):
+            self._throttle()
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode(errors="replace")[:300]
+                if exc.code != 429 and exc.code < 500:
+                    raise RuntimeError(f"Hyperliquid HTTP {exc.code}: {detail}") from exc
+                if attempt == self.max_attempts - 1:
+                    raise RuntimeError(f"Hyperliquid HTTP {exc.code}: {detail}") from exc
+                self.sleep(self._retry_delay(attempt, exc.headers))
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt == self.max_attempts - 1:
+                    reason = getattr(exc, "reason", exc)
+                    raise RuntimeError(f"Hyperliquid request failed: {reason}") from exc
+                self.sleep(self._retry_delay(attempt))
+        raise RuntimeError("Hyperliquid request failed after retries")
+
+    def _throttle(self) -> None:
+        now = self.monotonic()
+        if self._last_request_at is not None:
+            remaining = self.request_interval_seconds - (now - self._last_request_at)
+            if remaining > 0:
+                self.sleep(remaining)
+                now = self.monotonic()
+        self._last_request_at = now
+
+    @staticmethod
+    def _retry_delay(attempt: int, headers: Message | None = None) -> float:
+        if headers is not None:
+            retry_after = headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(float(retry_after), 1.0)
+                except ValueError:
+                    pass
+        return float(2**attempt)
 
     def dex_names(self) -> list[str]:
         data = self.post({"type": "perpDexs"})
@@ -71,8 +116,47 @@ class HyperliquidClient:
                     continue
         return output
 
-    def funding_history(self, coin: str, days: int) -> list[FundingPoint]:
-        start_ms = int((time.time() - days * 86_400) * 1000)
+    def market_snapshot(self, coin: str, dex: str) -> MarketSnapshot | None:
+        payload: dict[str, object] = {"type": "metaAndAssetCtxs"}
+        if dex != "(main)":
+            payload["dex"] = dex
+        data = self.post(payload)
+        try:
+            universe, contexts = data[0].get("universe", []), data[1]
+        except (IndexError, TypeError, AttributeError) as exc:
+            raise RuntimeError("invalid Hyperliquid market snapshot response") from exc
+        captured_at = datetime.now().astimezone()
+        for asset, context in zip(universe, contexts):
+            if (
+                not isinstance(asset, dict)
+                or not isinstance(context, dict)
+                or asset.get("name") != coin
+                or asset.get("isDelisted")
+            ):
+                continue
+            try:
+                mark = float(context["markPx"])
+                return MarketSnapshot(
+                    dex=dex,
+                    coin=coin,
+                    funding_rate=float(context.get("funding") or 0),
+                    open_interest_usd=float(context.get("openInterest") or 0) * mark,
+                    day_volume_usd=float(context.get("dayNtlVlm") or 0),
+                    mark_price=mark,
+                    captured_at=captured_at,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("invalid Hyperliquid market fields") from exc
+        return None
+
+    def funding_history(
+        self,
+        coin: str,
+        days: int,
+        start_time_ms: int | None = None,
+    ) -> list[FundingPoint]:
+        window_start_ms = int((time.time() - days * 86_400) * 1000)
+        start_ms = max(start_time_ms or window_start_ms, window_start_ms)
         points: dict[int, FundingPoint] = {}
         while True:
             data = self.post({"type": "fundingHistory", "coin": coin, "startTime": start_ms})

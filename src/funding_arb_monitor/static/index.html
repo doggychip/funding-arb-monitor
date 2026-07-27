@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Funding Arb Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101216;
+      --surface: #181b20;
+      --surface-2: #20242b;
+      --line: #343a43;
+      --text: #e8eaed;
+      --muted: #a8b0bb;
+      --green: #44c580;
+      --red: #ef7474;
+      --amber: #e7b95a;
+      --blue: #7db3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+    }
+    main { max-width: 1280px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { font-size: 26px; margin: 0; }
+    h2 { font-size: 16px; margin: 0 0 6px; }
+    .subtle { color: var(--muted); margin: 4px 0 0; }
+    .header { display: flex; justify-content: space-between; gap: 16px; align-items: start; margin-bottom: 24px; }
+    button, select, input {
+      background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px;
+      color: var(--text); font: inherit; padding: 8px 10px;
+    }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--blue); }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .stat, .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    .stat .value { font-size: 24px; font-weight: 650; }
+    .stat .label { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+    .filters label { color: var(--muted); font-size: 12px; display: grid; gap: 4px; }
+    .filters input { min-width: 180px; }
+    .table-wrap { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px 12px; text-align: right; }
+    th { color: var(--muted); font-size: 12px; font-weight: 550; position: sticky; top: 0; background: var(--surface); }
+    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:last-child, td:last-child { text-align: left; }
+    tbody tr:hover { background: var(--surface-2); }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .neutral { color: var(--muted); }
+    .badge { border: 1px solid var(--line); border-radius: 999px; display: inline-block; font-size: 12px; padding: 2px 7px; }
+    .badge.eligible { border-color: var(--green); color: var(--green); }
+    .badge.review { border-color: var(--amber); color: var(--amber); }
+    #empty { color: var(--muted); display: none; padding: 28px 0 8px; }
+    .notice { color: var(--muted); font-size: 12px; margin-top: 14px; }
+    .charts { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-top: 14px; }
+    .chart { background: var(--surface-2); border-radius: 6px; padding: 10px; min-width: 0; }
+    .chart h3 { color: var(--muted); font-size: 12px; font-weight: 550; margin: 0 0 6px; }
+    .chart svg { display: block; height: 240px; overflow: visible; width: 100%; }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; }
+    .legend span::before { background: var(--color); border-radius: 50%; content: ""; display: inline-block; height: 8px; margin-right: 5px; width: 8px; }
+    @media (max-width: 720px) {
+      main { padding: 20px 12px 40px; }
+      .header { display: block; }
+      .header button { margin-top: 16px; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .charts { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="header">
+      <div>
+        <h1>Funding Arb Monitor</h1>
+        <p class="subtle" id="scan-meta">Loading latest persisted scan…</p>
+      </div>
+      <button type="button" id="refresh">Refresh data</button>
+    </section>
+
+    <section class="stats" aria-label="Scan summary">
+      <div class="stat"><div class="value" id="candidate-count">—</div><div class="label">Candidates analyzed</div></div>
+      <div class="stat"><div class="value positive" id="eligible-count">—</div><div class="label">Passed monitoring gates</div></div>
+      <div class="stat"><div class="value" id="best-carry">—</div><div class="label">Best 7d realized APR</div></div>
+      <div class="stat"><div class="value" id="total-oi">—</div><div class="label">Candidate open interest</div></div>
+    </section>
+
+    <section class="filters" aria-label="Candidate filters">
+      <label>Search market
+        <input id="search" type="search" placeholder="Coin or dex">
+      </label>
+      <label>Status
+        <select id="status">
+          <option value="all">All candidates</option>
+          <option value="eligible">Eligible only</option>
+          <option value="review">Needs review</option>
+        </select>
+      </label>
+      <label>Minimum 7d realized APR
+        <select id="min-apr">
+          <option value="-100000">Any</option>
+          <option value="0">0%</option>
+          <option value="10">10%</option>
+          <option value="15">15%</option>
+          <option value="25">25%</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Market</th><th>Dex</th><th>Structure</th><th>7d APR</th><th>24h APR</th>
+              <th>Current APR</th><th>Neg. hours</th><th>OI</th><th>Decision / reason</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="empty">No persisted scan yet. Run <code>funding-arb-monitor scan</code>, then refresh this page.</div>
+    </section>
+    <section style="margin-top: 20px">
+      <h2>Trade recommendations &amp; proposed actions</h2>
+      <p class="subtle">Every market that passed monitoring gates is listed with its executable hedge result and next action. Approval requotes both legs before opening a simulated position.</p>
+      <div class="panel">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Market</th><th>Gross APR</th><th>Best hedge</th><th>7d net APR</th><th>14d net APR</th><th>30d net APR</th><th>Match result</th><th>Proposed action</th></tr>
+            </thead>
+            <tbody id="recommendation-rows"></tbody>
+          </table>
+        </div>
+        <div id="recommendation-empty">No market currently passes the monitoring gates.</div>
+      </div>
+    </section>
+    <section style="margin-top: 20px">
+      <h2>Shadow paper performance</h2>
+      <p class="subtle">Qualified trades are opened automatically as simulations only, capped at three concurrent positions. No exchange credentials or orders are used.</p>
+      <div class="stats" style="margin-top: 10px">
+        <div class="stat"><div class="value" id="completed-trades">—</div><div class="label">Completed trades</div></div>
+        <div class="stat"><div class="value" id="paper-win-rate">—</div><div class="label">Win rate</div></div>
+        <div class="stat"><div class="value" id="realized-paper-pnl">—</div><div class="label">Realized net P&amp;L</div></div>
+        <div class="stat"><div class="value negative" id="paper-drawdown">—</div><div class="label">Maximum drawdown</div></div>
+      </div>
+      <div id="performance-detail" class="notice"></div>
+    </section>
+    <section style="margin-top: 20px">
+      <h2>Paper positions</h2>
+      <p class="subtle">Simulated paired hedges only. Funding accrues from public history; marks, drift, and conservative exits update via <code>paper update</code>.</p>
+      <div class="panel">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Market</th><th>Hedge venue</th><th>Status</th><th>Notional</th><th>Funding P&L</th><th>Pair MTM</th><th>Drift</th><th>Net P&L status</th><th>Timeline</th></tr>
+            </thead>
+            <tbody id="paper-rows"></tbody>
+          </table>
+        </div>
+        <div id="paper-empty">No paper positions yet. Use <code>funding-arb-monitor paper open</code> to create a simulated paired hedge.</div>
+      </div>
+    </section>
+    <section id="timeline-section" style="display: none; margin-top: 20px">
+      <h2 id="timeline-title">Position timeline</h2>
+      <p class="subtle" id="timeline-detail"></p>
+      <div class="panel" style="margin-top: 10px">
+        <div class="charts">
+          <div class="chart">
+            <h3>Cumulative P&amp;L (USD)</h3>
+            <svg id="pnl-chart" role="img" aria-label="Position profit and loss timeline"></svg>
+            <div class="legend">
+              <span style="--color: #44c580">Net P&amp;L</span>
+              <span style="--color: #7db3ff">Funding P&amp;L</span>
+              <span style="--color: #e7b95a">Pair MTM</span>
+            </div>
+          </div>
+          <div class="chart">
+            <h3>Perp–hedge basis and drift (%)</h3>
+            <svg id="basis-chart" role="img" aria-label="Position basis and hedge drift timeline"></svg>
+            <div class="legend">
+              <span style="--color: #b28dff">Signed basis</span>
+              <span style="--color: #ef7474">Absolute drift</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <p class="notice">
+      Read-only monitoring. APR is gross funding only and excludes fees, slippage, borrow, FX, market-session gaps, and market impact.
+      “Eligible” means it passed configurable monitoring gates—not that a trade is approved.
+    </p>
+  </main>
+  <script>
+    let candidates = [];
+
+    const money = new Intl.NumberFormat("en-US", {
+      style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 1
+    });
+    const percent = (value) => value == null ? "—" : `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+    const numberClass = (value) => value > 0 ? "positive" : value < 0 ? "negative" : "neutral";
+    const reasons = (row) => row.eligible ? "Passed monitoring gates" : row.reasons.join(", ").replaceAll("_", " ");
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+    })[char]);
+
+    function render() {
+      const search = document.querySelector("#search").value.toLowerCase().trim();
+      const status = document.querySelector("#status").value;
+      const minApr = Number(document.querySelector("#min-apr").value);
+      const rows = candidates
+        .filter((row) => !search || `${row.coin} ${row.dex}`.toLowerCase().includes(search))
+        .filter((row) => status === "all" || (status === "eligible") === row.eligible)
+        .filter((row) => (row.realized_7d_apr_pct ?? -Infinity) >= minApr)
+        .sort((a, b) => (b.realized_7d_apr_pct ?? -Infinity) - (a.realized_7d_apr_pct ?? -Infinity));
+
+      document.querySelector("#rows").innerHTML = rows.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.coin)}</td>
+          <td>${escapeHtml(row.dex)}</td>
+          <td>${escapeHtml(row.side.replaceAll("_", " "))}</td>
+          <td class="${numberClass(row.realized_7d_apr_pct)}">${percent(row.realized_7d_apr_pct)}</td>
+          <td class="${numberClass(row.realized_24h_apr_pct)}">${percent(row.realized_24h_apr_pct)}</td>
+          <td class="${numberClass(row.current_apr_pct)}">${percent(row.current_apr_pct)}</td>
+          <td>${row.negative_hour_share_pct.toFixed(1)}%</td>
+          <td>${money.format(row.open_interest_usd)}</td>
+          <td><span class="badge ${row.eligible ? "eligible" : "review"}">${escapeHtml(reasons(row))}</span></td>
+        </tr>
+      `).join("");
+      document.querySelector("#empty").style.display = candidates.length === 0 ? "block" : "none";
+    }
+
+    async function load() {
+      const meta = document.querySelector("#scan-meta");
+      meta.textContent = "Loading latest persisted scan…";
+      try {
+        const response = await fetch("/api/candidates");
+        if (!response.ok) throw new Error("API request failed");
+        candidates = await response.json();
+        const eligible = candidates.filter((row) => row.eligible);
+        const best = [...candidates].sort((a, b) => (b.realized_7d_apr_pct ?? -Infinity) - (a.realized_7d_apr_pct ?? -Infinity))[0];
+        const analyzedAt = candidates[0]?.analyzed_at;
+        const statusResponse = await fetch("/api/status");
+        const scanStatus = statusResponse.ok ? await statusResponse.json() : null;
+        document.querySelector("#candidate-count").textContent = candidates.length;
+        document.querySelector("#eligible-count").textContent = eligible.length;
+        document.querySelector("#best-carry").textContent = best ? percent(best.realized_7d_apr_pct) : "—";
+        document.querySelector("#total-oi").textContent = money.format(candidates.reduce((sum, row) => sum + row.open_interest_usd, 0));
+        meta.textContent = analyzedAt
+          ? `Latest scan: ${new Date(analyzedAt).toLocaleString()} · ${candidates.length} analyzed markets · run ${scanStatus?.status ?? "unknown"}`
+          : "No persisted scan yet";
+        render();
+        await loadRecommendations();
+        await loadPerformance();
+        await loadPaper();
+      } catch (error) {
+        meta.textContent = "Could not load candidates. Confirm the API is running.";
+        candidates = [];
+        render();
+      }
+    }
+
+    async function loadRecommendations() {
+      const response = await fetch("/api/paper/recommendations");
+      const recommendations = response.ok ? await response.json() : [];
+      const pendingByCoin = new Map(
+        recommendations.filter((item) => item.status === "pending").map((item) => [item.coin, item])
+      );
+      const checksResponse = await fetch("/api/paper/match-checks");
+      const checks = checksResponse.ok ? await checksResponse.json() : [];
+      const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
+      const ideas = candidates.filter((item) => item.eligible);
+
+      const proposedAction = (status, recommendation, check) => {
+        if (recommendation) {
+          return `<button type="button" data-approve="${recommendation.id}">Approve $${recommendation.notional_usd.toFixed(0)} paper pair</button>`;
+        }
+        if ((check?.net_apr_14d_pct ?? -Infinity) >= 10) {
+          return "Watch; qualifies only if carry persists for 14 days";
+        }
+        if ((check?.net_apr_30d_pct ?? -Infinity) >= 10) {
+          return "Watch; qualifies only near a 30-day hold";
+        }
+        return escapeHtml(({
+          no_exact_spot_market: "Monitor only; wait for an exact spot listing",
+          spot_depth_below_5x_notional: "Skip now; recheck depth next hour",
+          net_carry_below_threshold: "Skip; carry does not clear costs",
+          all_spot_venues_unavailable: "Retry automatically next hour",
+          missing_perp_snapshot: "Wait for a fresh perp snapshot",
+          stale_perp_snapshot: "Wait for the next successful scan",
+          already_open: "Track the existing paper position",
+          pending_approval: "Generate a fresh executable quote"
+        })[status] || "Continue monitoring; no paper action");
+      };
+
+      document.querySelector("#recommendation-rows").innerHTML = ideas.map((candidate) => {
+        const recommendation = pendingByCoin.get(candidate.coin);
+        const check = checksByCoin.get(candidate.coin);
+        const status = check?.status || (recommendation ? "pending_approval" : "not_checked");
+        const hedgeVenue = recommendation?.venue || check?.hedge_venue;
+        const hedgeSymbol = recommendation?.hedge_symbol || check?.hedge_symbol;
+        const hedge = hedgeVenue
+          ? `${hedgeVenue} · ${hedgeSymbol}`
+          : "No executable hedge";
+        const result = check?.detail || status.replaceAll("_", " ");
+        const net7d = recommendation?.executable_net_apr_pct ?? check?.net_apr_7d_pct;
+        return `
+        <tr>
+          <td>${escapeHtml(candidate.coin)}</td>
+          <td class="${numberClass(candidate.realized_7d_apr_pct)}">${percent(candidate.realized_7d_apr_pct)}</td>
+          <td>${escapeHtml(hedge)}</td>
+          <td class="${numberClass(net7d ?? 0)}">${percent(net7d)}</td>
+          <td class="${numberClass(check?.net_apr_14d_pct ?? 0)}">${percent(check?.net_apr_14d_pct)}</td>
+          <td class="${numberClass(check?.net_apr_30d_pct ?? 0)}">${percent(check?.net_apr_30d_pct)}</td>
+          <td><span class="badge ${recommendation ? "eligible" : "review"}">${escapeHtml(result)}</span></td>
+          <td>${proposedAction(status, recommendation, check)}</td>
+        </tr>
+      `}).join("");
+      document.querySelector("#recommendation-empty").style.display = ideas.length ? "none" : "block";
+    }
+
+    async function loadPaper() {
+      const response = await fetch("/api/paper/positions?include_closed=true");
+      const positions = response.ok ? await response.json() : [];
+      document.querySelector("#paper-rows").innerHTML = positions.map((position) => {
+        const liquidityWarning = position.closed_at_ms == null && position.liquidity_degraded;
+        const status = position.closed_at_ms != null
+          ? position.exit_reason.replaceAll("_", " ")
+          : liquidityWarning
+            ? `Liquidity warning: ${position.liquidity_reasons.replaceAll("_", " ")}`
+            : "Open";
+        return `
+        <tr>
+          <td>${escapeHtml(position.coin)}</td>
+          <td>${escapeHtml(position.hedge_venue)}</td>
+          <td><span class="badge ${position.closed_at_ms == null && !liquidityWarning ? "eligible" : "review"}">${escapeHtml(status)}</span></td>
+          <td>${money.format(position.notional_usd)}</td>
+          <td class="${numberClass(position.funding_pnl_usd)}">${money.format(position.funding_pnl_usd)}</td>
+          <td class="${numberClass(position.mark_to_market_pnl_usd)}">${money.format(position.mark_to_market_pnl_usd)}</td>
+          <td>${position.hedge_drift_pct == null ? "—" : `${position.hedge_drift_pct.toFixed(2)}%`}</td>
+          <td class="${numberClass(position.net_pnl_usd)}">${money.format(position.net_pnl_usd)} · ${escapeHtml(position.pnl_status.replaceAll("_", " "))}</td>
+          <td><button type="button" data-timeline="${position.id}">View chart</button></td>
+        </tr>
+      `}).join("");
+      document.querySelector("#paper-empty").style.display = positions.length ? "none" : "block";
+    }
+
+    function renderLineChart(selector, points, series, formatValue) {
+      const svg = document.querySelector(selector);
+      const width = 900;
+      const height = 240;
+      const pad = { left: 62, right: 14, top: 12, bottom: 30 };
+      const values = series.flatMap((item) =>
+        points.map((point) => point[item.key]).filter((value) => Number.isFinite(value))
+      );
+      if (!points.length || !values.length) {
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.innerHTML = `<text x="20" y="35" fill="#a8b0bb">No observations yet</text>`;
+        return;
+      }
+      let minY = Math.min(...values, 0);
+      let maxY = Math.max(...values, 0);
+      if (minY === maxY) {
+        minY -= 1;
+        maxY += 1;
+      }
+      const minX = points[0].timestamp_ms;
+      const maxX = points[points.length - 1].timestamp_ms;
+      const x = (timestamp) => pad.left + (timestamp - minX) / Math.max(1, maxX - minX) * (width - pad.left - pad.right);
+      const y = (value) => pad.top + (maxY - value) / (maxY - minY) * (height - pad.top - pad.bottom);
+      const grid = [0, 0.5, 1].map((ratio) => {
+        const value = maxY - ratio * (maxY - minY);
+        const cy = y(value);
+        return `<line x1="${pad.left}" y1="${cy}" x2="${width - pad.right}" y2="${cy}" stroke="#343a43" stroke-width="1"/>
+          <text x="${pad.left - 8}" y="${cy + 4}" fill="#a8b0bb" font-size="11" text-anchor="end">${escapeHtml(formatValue(value))}</text>`;
+      }).join("");
+      const lines = series.map((item) => {
+        const coordinates = points
+          .filter((point) => Number.isFinite(point[item.key]))
+          .map((point) => `${x(point.timestamp_ms)},${y(point[item.key])}`)
+          .join(" ");
+        return `<polyline points="${coordinates}" fill="none" stroke="${item.color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+      }).join("");
+      const start = new Date(minX).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      const end = new Date(maxX).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.innerHTML = `${grid}${lines}
+        <text x="${pad.left}" y="${height - 7}" fill="#a8b0bb" font-size="11">${escapeHtml(start)}</text>
+        <text x="${width - pad.right}" y="${height - 7}" fill="#a8b0bb" font-size="11" text-anchor="end">${escapeHtml(end)}</text>`;
+    }
+
+    async function loadTimeline(positionId) {
+      const response = await fetch(`/api/paper/positions/${positionId}/timeline`);
+      if (!response.ok) return;
+      const timeline = await response.json();
+      const position = timeline.position;
+      document.querySelector("#timeline-title").textContent = `${position.coin} position timeline`;
+      document.querySelector("#timeline-detail").textContent =
+        `${position.closed_at_ms == null ? "Open" : "Closed"} · ${position.hedge_venue} ${position.hedge_symbol || ""} · ${timeline.points.length} observations`;
+      document.querySelector("#timeline-section").style.display = "block";
+      renderLineChart("#pnl-chart", timeline.points, [
+        { key: "net_pnl_usd", color: "#44c580" },
+        { key: "funding_pnl_usd", color: "#7db3ff" },
+        { key: "pair_mtm_usd", color: "#e7b95a" }
+      ], (value) => `$${value.toFixed(1)}`);
+      renderLineChart("#basis-chart", timeline.points, [
+        { key: "basis_pct", color: "#b28dff" },
+        { key: "hedge_drift_pct", color: "#ef7474" }
+      ], (value) => `${value.toFixed(2)}%`);
+      document.querySelector("#timeline-section").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    async function loadPerformance() {
+      const response = await fetch("/api/paper/performance");
+      if (!response.ok) return;
+      const performance = await response.json();
+      document.querySelector("#completed-trades").textContent = performance.completed_trades;
+      document.querySelector("#paper-win-rate").textContent = performance.win_rate_pct == null
+        ? "—"
+        : `${performance.win_rate_pct.toFixed(1)}%`;
+      const realized = document.querySelector("#realized-paper-pnl");
+      realized.textContent = money.format(performance.realized_net_pnl_usd);
+      realized.className = `value ${numberClass(performance.realized_net_pnl_usd)}`;
+      document.querySelector("#paper-drawdown").textContent = money.format(performance.max_drawdown_usd);
+      const reasons = Object.entries(performance.exit_reasons)
+        .map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${count}`)
+        .join(" · ");
+      const averageHold = performance.average_holding_hours == null
+        ? "—"
+        : `${performance.average_holding_hours.toFixed(1)}h`;
+      const graduation = performance.graduation;
+      document.querySelector("#performance-detail").textContent =
+        `Open positions: ${performance.open_positions} · Open net P&L: ${money.format(performance.open_net_pnl_usd)} · Average hold: ${averageHold} · Live-review evidence: ${graduation.closed_trades}/${graduation.required_closed_trades} closed trades and ${graduation.observation_weeks.toFixed(1)}/${graduation.required_observation_weeks} weeks${reasons ? ` · Exits: ${reasons}` : ""}`;
+    }
+
+    document.querySelector("#refresh").addEventListener("click", load);
+    document.querySelector("#recommendation-rows").addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-approve]");
+      if (!button) return;
+      let approvalToken = sessionStorage.getItem("funding-arb-approval-token");
+      if (!approvalToken) {
+        approvalToken = prompt("Enter the paper-approval token");
+        if (!approvalToken) return;
+        sessionStorage.setItem("funding-arb-approval-token", approvalToken);
+      }
+      button.disabled = true;
+      const response = await fetch(`/api/paper/recommendations/${button.dataset.approve}/approve`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${approvalToken}` }
+      });
+      if (!response.ok) {
+        const error = await response.json();
+        if (response.status === 401) sessionStorage.removeItem("funding-arb-approval-token");
+        alert(error.detail || "Approval failed");
+      }
+      await load();
+    });
+    document.querySelector("#paper-rows").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-timeline]");
+      if (button) loadTimeline(button.dataset.timeline);
+    });
+    ["#search", "#status", "#min-apr"].forEach((selector) => document.querySelector(selector).addEventListener("input", render));
+    load();
+  </script>
+</body>
+</html>

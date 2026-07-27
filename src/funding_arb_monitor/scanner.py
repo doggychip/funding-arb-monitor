@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import dataclass
 
 from .analytics import (
@@ -8,7 +10,9 @@ from .analytics import (
     realized_apr_pct,
     rolling_apr_pct,
 )
+from .alerts import render_scan_failure, send_discord_alert
 from .hyperliquid import HyperliquidClient
+from .costs import CostAssumptions, hedge_assessment
 from .models import Candidate, MarketSnapshot, utc_now
 from .store import Store
 
@@ -21,6 +25,7 @@ class ScanConfig:
     min_realized_7d_apr_pct: float = 15
     max_negative_hour_share_pct: float = 25
     min_day_volume_usd: float = 500_000
+    min_estimated_net_7d_apr_pct: float = 0
 
 
 class Scanner:
@@ -28,6 +33,7 @@ class Scanner:
         self.client = client
         self.store = store
         self.config = config
+        self.costs = CostAssumptions()
 
     def select_history_candidates(self, snapshots: list[MarketSnapshot]) -> list[MarketSnapshot]:
         liquid = [
@@ -41,14 +47,45 @@ class Scanner:
 
     def run(self) -> list[Candidate]:
         self.store.initialize()
+        run_id = self.store.start_scan_run()
+        try:
+            return self._run(run_id)
+        except Exception as exc:
+            self.store.finish_scan_run(run_id, status="failed", error=str(exc))
+            send_discord_alert(
+                render_scan_failure(exc),
+                store=self.store,
+                event_type="scan_failed",
+            )
+            raise
+
+    def _run(self, run_id: int) -> list[Candidate]:
         snapshots = self.client.snapshots()
+        if not snapshots:
+            raise RuntimeError("snapshot discovery returned no live markets")
         self.store.save_snapshots(snapshots)
         analyzed_at = utc_now()
         output: list[Candidate] = []
+        failed_market_count = 0
 
         for snapshot in self.select_history_candidates(snapshots):
-            history = self.client.funding_history(snapshot.coin, self.config.days)
-            self.store.save_funding(history)
+            window_start_ms = int((time.time() - self.config.days * 86_400) * 1000)
+            latest_timestamp = self.store.latest_funding_timestamp(snapshot.coin)
+            incremental_start = max(window_start_ms, (latest_timestamp + 1) if latest_timestamp else 0)
+            refresh_failed = False
+            try:
+                new_history = self.client.funding_history(
+                    snapshot.coin,
+                    self.config.days,
+                    start_time_ms=incremental_start,
+                )
+                self.store.save_funding(new_history)
+            except RuntimeError as exc:
+                refresh_failed = True
+                failed_market_count += 1
+                print(f"{snapshot.coin}: funding refresh failed: {exc}", file=sys.stderr)
+
+            history = self.store.funding_history(snapshot.coin, window_start_ms)
             rates = [(point.timestamp_ms, point.funding_rate) for point in history]
             realized = realized_apr_pct(rates)
             seven_day = rolling_apr_pct(rates, 168)
@@ -58,10 +95,21 @@ class Scanner:
                 continue
 
             reasons: list[str] = []
+            if refresh_failed:
+                reasons.append("funding_refresh_failed")
+            if history and history[-1].timestamp_ms < int((time.time() - 3 * 3_600) * 1000):
+                reasons.append("funding_history_stale")
+            estimated_net = (
+                self.costs.estimated_net_annual_apr_pct(seven_day)
+                if seven_day is not None
+                else None
+            )
             if seven_day is None:
                 reasons.append("insufficient_7d_history")
             elif abs(seven_day) < self.config.min_realized_7d_apr_pct:
                 reasons.append("7d_realized_apr_below_threshold")
+            elif estimated_net is not None and estimated_net < self.config.min_estimated_net_7d_apr_pct:
+                reasons.append("estimated_net_carry_below_cost_threshold")
             if negative > self.config.max_negative_hour_share_pct:
                 reasons.append("funding_reverses_too_often")
             if snapshot.day_volume_usd < self.config.min_day_volume_usd:
@@ -86,6 +134,8 @@ class Scanner:
                     realized_apr_pct=realized,
                     realized_7d_apr_pct=seven_day,
                     realized_24h_apr_pct=one_day,
+                    estimated_net_7d_apr_pct=estimated_net,
+                    hedge_assessment=hedge_assessment(snapshot.coin),
                     negative_hour_share_pct=negative,
                     peak_decay_halflife_hours=peak_decay_halflife_hours(rates),
                     eligible=not reasons,
@@ -96,4 +146,12 @@ class Scanner:
 
         output.sort(key=lambda item: abs(item.realized_7d_apr_pct or 0), reverse=True)
         self.store.save_candidates(output)
+        self.store.finish_scan_run(
+            run_id,
+            status="partial" if failed_market_count else "success",
+            snapshot_count=len(snapshots),
+            candidate_count=len(output),
+            eligible_count=sum(candidate.eligible for candidate in output),
+            failed_market_count=failed_market_count,
+        )
         return output

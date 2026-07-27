@@ -17,9 +17,18 @@ Current-hour funding APR is a snapshot, not a forecast. The scanner instead reco
 - an explicit long-perp/short-underlying flag for negative funding, because borrow must be
   independently verified.
 
-The tool still does not model fees, slippage, borrow, FX, underlying market-session gaps, or
-your own market impact. Equity perps are not a 24/7 delta-neutral arbitrage when the stock
-exchange is shut.
+Hourly runs fetch only funding records newer than the latest stored point. Public API requests
+are throttled and transient disconnects, HTTP 429 responses, and server errors use bounded
+exponential backoff. If one market still fails, the rest of the scan completes; cached data for
+that market is marked `funding_refresh_failed` and cannot pass the monitoring gates.
+
+Paper matching adds a conservative cost model (10 bps perp fill, each venue's base taker fee,
+5% annual financing, and a 7-day hold) and requires an exact same-asset OKX, Binance, Coinbase,
+or Kraken spot book with ≥5× notional depth and ≥10% executable net APR. The dashboard also
+shows 14- and 30-day net-APR sensitivity, but approval remains gated by the 7-day case. OKX and
+Binance prefer USDC books, then USDT; stablecoin basis/depeg risk is not modeled. Equity perps
+(`xyz:*`) usually fail exact-spot matching and are not a 24/7 delta-neutral arb when the cash
+market is shut. FX, session gaps, and your own market impact are still out of scope.
 
 ## Run locally
 
@@ -31,11 +40,68 @@ pip install -e '.[dev]'
 # Fetch and persist a scan; prints only candidates and their rejection reasons.
 funding-arb-monitor scan --days 30 --min-oi 1000000
 
-# Run the read-only API, then visit http://127.0.0.1:8080/docs.
+# Run the read-only dashboard/API.
 funding-arb-monitor serve
 ```
 
-The API exposes `GET /healthz` and `GET /api/candidates`.
+Open http://127.0.0.1:8080 for the local dashboard. It shows scan status, candidates, trade
+recommendations, performance, and P&L/basis timelines for open and closed paper positions. FastAPI
+docs remain at http://127.0.0.1:8080/docs.
+
+Useful endpoints: `GET /healthz`, `GET /api/status`, `GET /api/candidates`,
+`GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
+`GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
+`GET /api/paper/performance`, `GET /api/alerts/deliveries`, and
+`POST /api/paper/recommendations/{id}/approve`.
+
+## Paper positions
+
+Paper positions are accounting entries only; they never create exchange orders or use credentials.
+The default notional is $1,000, with at most three concurrent positions. The Zeabur scheduler
+uses shadow mode to auto-open qualified simulations; manual approval remains available:
+
+```bash
+# Match eligible candidates to OKX/Binance/Coinbase/Kraken exact-asset books.
+funding-arb-monitor paper recommend
+
+# Or automatically open every qualified result as a simulated position only.
+funding-arb-monitor paper shadow
+
+# Requote both legs, recheck gates/depth/net APR, then atomically open the simulated pair.
+# The command rejects deteriorated or expired recommendations.
+funding-arb-monitor paper approve --id 1
+
+# Accrue public funding into open simulated positions; idempotent per funding hour.
+funding-arb-monitor paper accrue
+
+# Refresh hedge marks, liquidity, drift, net-after-exit, and conservative exit flags.
+funding-arb-monitor paper update
+
+# Summary of funding P&L, MTM, and costs.
+funding-arb-monitor paper report
+
+# Verify Discord delivery from the deployed runtime.
+funding-arb-monitor paper alert-test
+```
+
+Manual open still exists if you already know the hedge venue:
+
+```bash
+funding-arb-monitor paper open \
+  --coin XMR \
+  --hedge-venue coinbase \
+  --notional 1000
+```
+
+Monitoring-eligible ≠ tradeable. `paper recommend` often returns `[]` when eligible names have no
+exact liquid spot hedge (for example `CASHCAT` or `xyz:PALLADIUM`). Those outcomes are stored as
+match checks (`no_exact_spot_market`, thin depth, net APR below threshold) and shown on the dashboard.
+
+Open positions generate a warning after one degraded-liquidity observation. They close only after
+three consecutive hourly observations with Hyperliquid 24h volume below $500,000 or public spot-book
+depth below 2x position notional. Simulated exits persist executable prices, spread, depth, quantity,
+and timestamp; open P&L remains labeled as estimated while closed P&L is labeled simulated-realized.
+Database initialization applies these additions idempotently without replacing existing history.
 
 ## Alerts
 
@@ -46,26 +112,70 @@ export FUNDING_ARB_WEBHOOK_URL="https://example.invalid/webhook"
 funding-arb-monitor scan --alert
 ```
 
-No alert is sent when the variable is absent.
+Default alerts are dashboard/API only. No alert is sent when the variable is absent.
+
+For Discord notifications on shadow entries, liquidity warnings, position exits, scheduler failures,
+and the daily heartbeat, set a Discord channel webhook URL:
+
+```bash
+export FUNDING_ARB_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+```
+
+Webhook delivery failures do not interrupt scanning or position tracking. Messages suppress Discord
+mentions and never include exchange credentials. Delivery retries and final outcomes are stored in
+SQLite and exposed through `GET /api/alerts/deliveries`.
 
 ## Scheduling
 
-Run an hourly scan on the host:
+Hourly host cron (times are local):
 
 ```cron
-5 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor scan --days 30 --alert >> data/scanner.log 2>&1
+5 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor scan --days 30 --min-oi 1000000 >> data/scanner.log 2>&1
+7 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper shadow >> data/scanner.log 2>&1
+10 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper accrue >> data/scanner.log 2>&1
+12 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper update >> data/scanner.log 2>&1
+15 17 * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper report >> data/paper-report.log 2>&1
+16 17 * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper heartbeat >> data/scanner.log 2>&1
 ```
 
-Or use the one-shot Compose scanner:
+The Docker image runs the API and the same schedule in one process by default. Override
+`FUNDING_ARB_SCHEDULER=0` if another scheduler owns these jobs.
 
 ```bash
-docker compose --profile scan run --rm scanner
-docker compose up --build api
+docker build -t funding-arb-monitor .
+docker run --rm -p 8080:8080 -v funding-arb-data:/data \
+  -e FUNDING_ARB_APPROVAL_TOKEN="$(openssl rand -hex 32)" \
+  funding-arb-monitor
 ```
 
-## Graduation criteria for paper trading
+## Zeabur
 
-Do not add exchange keys until the monitor has retained enough scans to validate its gates.
-The next phase should be a separate paper-execution service that reconciles both legs, models
-fees/borrow/slippage, enforces hedge and liquidation limits, and has a kill switch. Live
-execution should remain a separate, opt-in project boundary.
+Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
+
+1. Keep the service at one replica so only one scheduler runs.
+2. Add a persistent volume mounted at `/data`.
+3. Set `FUNDING_ARB_APPROVAL_TOKEN` to a random secret. The dashboard asks for it only when
+   approving a paper recommendation; read-only pages remain public.
+4. Set `FUNDING_ARB_DISCORD_WEBHOOK_URL` to enable operational paper-trading alerts.
+5. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
+6. Generate a Zeabur domain after the health check at `/healthz` passes.
+
+The container honors Zeabur's `PORT` variable. Deleting or detaching the `/data` volume deletes
+the SQLite scan and paper-trading history.
+
+### Additive database migration
+
+Back up the `/data` volume before deployment. On startup, `Store.initialize()` creates the
+`paper_liquidity_checks` and `alert_deliveries` tables and adds nullable exit-execution columns to
+`paper_positions`. Existing rows and IDs are preserved. Verify `/healthz`, the current paper
+position, and `/api/alerts/deliveries` after deployment. Rolling back the application image is safe
+because the previous version ignores these additive tables and columns.
+
+## Graduation criteria for live trading
+
+Do not add exchange keys until match checks show repeatable exact-asset hedges with positive
+executable net APR after costs, and paper positions survive conservative exits (net ≤ 0, funding
+flip, drift > 2%, three-hour liquidity deterioration, or 7-day hold). The dashboard requires at
+least 30 closed simulations and four observation weeks before marking the evidence eligible for a
+live-trading review. That status is evidence for review, not permission to trade. Live execution
+should remain a separate, opt-in project boundary.
