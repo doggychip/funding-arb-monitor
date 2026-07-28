@@ -573,6 +573,36 @@ class Store:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
+                WITH ranked AS (
+                    SELECT payload_json,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY dex, coin
+                            ORDER BY analyzed_at DESC
+                        ) AS recency_rank
+                    FROM candidates
+                )
+                SELECT payload_json
+                FROM ranked
+                WHERE recency_rank = 1
+                {eligible_clause}
+                ORDER BY json_extract(payload_json, '$.realized_7d_apr_pct') DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def latest_scan_candidates(
+        self, limit: int = 100, *, eligible_only: bool = False
+    ) -> list[dict[str, object]]:
+        eligible_clause = (
+            "AND json_extract(payload_json, '$.eligible') = 1"
+            if eligible_only
+            else ""
+        )
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
                 SELECT payload_json
                 FROM candidates
                 WHERE analyzed_at = (SELECT MAX(analyzed_at) FROM candidates)

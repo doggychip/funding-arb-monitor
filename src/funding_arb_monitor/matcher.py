@@ -46,7 +46,7 @@ class PaperMatcher:
 
     def recommend(self) -> list[dict[str, object]]:
         created: list[dict[str, object]] = []
-        for candidate in self.store.latest_candidates():
+        for candidate in self.store.latest_scan_candidates():
             if not candidate.get("eligible") or candidate.get("side") != "short_perp_long_hedge":
                 continue
             coin = str(candidate["coin"])

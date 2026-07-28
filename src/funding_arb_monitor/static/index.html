@@ -83,8 +83,8 @@
     </section>
 
     <section class="stats" aria-label="Scan summary">
-      <div class="stat"><div class="value" id="candidate-count">—</div><div class="label">Candidates analyzed</div></div>
-      <div class="stat"><div class="value positive" id="eligible-count">—</div><div class="label">Passed monitoring gates</div></div>
+      <div class="stat"><div class="value" id="candidate-count">—</div><div class="label">Markets tracked</div></div>
+      <div class="stat"><div class="value positive" id="eligible-count">—</div><div class="label">Current eligible markets</div></div>
       <div class="stat"><div class="value" id="best-carry">—</div><div class="label">Best 7d realized APR</div></div>
       <div class="stat"><div class="value" id="total-oi">—</div><div class="label">Candidate open interest</div></div>
     </section>
@@ -117,7 +117,7 @@
           <thead>
             <tr>
               <th>Market</th><th>Dex</th><th>Structure</th><th>7d APR</th><th>24h APR</th>
-              <th>Current APR</th><th>Neg. hours</th><th>OI</th><th>Decision / reason</th>
+              <th>Current APR</th><th>Neg. hours</th><th>OI</th><th>Analysis age</th><th>Decision / reason</th>
             </tr>
           </thead>
           <tbody id="rows"></tbody>
@@ -198,13 +198,31 @@
   </main>
   <script>
     let candidates = [];
+    let currentCandidates = [];
 
     const money = new Intl.NumberFormat("en-US", {
       style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 1
     });
     const percent = (value) => value == null ? "—" : `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
     const numberClass = (value) => value > 0 ? "positive" : value < 0 ? "negative" : "neutral";
-    const reasons = (row) => row.eligible ? "Passed monitoring gates" : row.reasons.join(", ").replaceAll("_", " ");
+    const isCurrentAnalysis = (row) =>
+      currentCandidates.some((candidate) =>
+        candidate.coin === row.coin
+        && candidate.dex === row.dex
+        && candidate.analyzed_at === row.analyzed_at
+      );
+    const reasons = (row) => {
+      if (!row.eligible) return row.reasons.join(", ").replaceAll("_", " ");
+      return isCurrentAnalysis(row)
+        ? "Passed monitoring gates"
+        : "Passed when analyzed; awaiting refresh";
+    };
+    const analysisAge = (value) => {
+      const seconds = Math.max(0, (Date.now() - new Date(value).getTime()) / 1000);
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+      return `${Math.floor(seconds / 86400)}d`;
+    };
     const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     })[char]);
@@ -229,7 +247,8 @@
           <td class="${numberClass(row.current_apr_pct)}">${percent(row.current_apr_pct)}</td>
           <td>${row.negative_hour_share_pct.toFixed(1)}%</td>
           <td>${money.format(row.open_interest_usd)}</td>
-          <td><span class="badge ${row.eligible ? "eligible" : "review"}">${escapeHtml(reasons(row))}</span></td>
+          <td title="${escapeHtml(new Date(row.analyzed_at).toLocaleString())}">${analysisAge(row.analyzed_at)}</td>
+          <td><span class="badge ${row.eligible && isCurrentAnalysis(row) ? "eligible" : "review"}">${escapeHtml(reasons(row))}</span></td>
         </tr>
       `).join("");
       document.querySelector("#empty").style.display = candidates.length === 0 ? "block" : "none";
@@ -239,12 +258,15 @@
       const meta = document.querySelector("#scan-meta");
       meta.textContent = "Loading latest persisted scan…";
       try {
-        const response = await fetch("/api/candidates");
+        const response = await fetch("/api/candidates?limit=500");
         if (!response.ok) throw new Error("API request failed");
         candidates = await response.json();
-        const eligible = candidates.filter((row) => row.eligible);
-        const best = [...candidates].sort((a, b) => (b.realized_7d_apr_pct ?? -Infinity) - (a.realized_7d_apr_pct ?? -Infinity))[0];
-        const analyzedAt = candidates[0]?.analyzed_at;
+        const currentResponse = await fetch("/api/candidates?limit=500&current_scan_only=true");
+        if (!currentResponse.ok) throw new Error("Current scan API request failed");
+        currentCandidates = await currentResponse.json();
+        const eligible = currentCandidates.filter((row) => row.eligible);
+        const best = [...currentCandidates].sort((a, b) => (b.realized_7d_apr_pct ?? -Infinity) - (a.realized_7d_apr_pct ?? -Infinity))[0];
+        const analyzedAt = currentCandidates[0]?.analyzed_at;
         const statusResponse = await fetch("/api/status");
         const scanStatus = statusResponse.ok ? await statusResponse.json() : null;
         document.querySelector("#candidate-count").textContent = candidates.length;
@@ -252,7 +274,7 @@
         document.querySelector("#best-carry").textContent = best ? percent(best.realized_7d_apr_pct) : "—";
         document.querySelector("#total-oi").textContent = money.format(candidates.reduce((sum, row) => sum + row.open_interest_usd, 0));
         meta.textContent = analyzedAt
-          ? `Latest scan: ${new Date(analyzedAt).toLocaleString()} · ${candidates.length} analyzed markets · run ${scanStatus?.status ?? "unknown"}`
+          ? `Latest scan: ${new Date(analyzedAt).toLocaleString()} · ${scanStatus?.candidate_count ?? currentCandidates.length} analyzed this run · ${candidates.length} markets tracked · run ${scanStatus?.status ?? "unknown"}`
           : "No persisted scan yet";
         render();
         await loadRecommendations();
@@ -261,6 +283,7 @@
       } catch (error) {
         meta.textContent = "Could not load candidates. Confirm the API is running.";
         candidates = [];
+        currentCandidates = [];
         render();
       }
     }
@@ -274,7 +297,7 @@
       const checksResponse = await fetch("/api/paper/match-checks");
       const checks = checksResponse.ok ? await checksResponse.json() : [];
       const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
-      const ideas = candidates.filter((item) => item.eligible);
+      const ideas = currentCandidates.filter((item) => item.eligible);
 
       const proposedAction = (status, recommendation, check) => {
         if (recommendation) {

@@ -49,11 +49,15 @@ recommendations, performance, and P&L/basis timelines for open and closed paper 
 docs remain at http://127.0.0.1:8080/docs.
 
 Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/candidates`
-(add `?eligible_only=true` to filter),
+(add `?eligible_only=true` to filter or `?current_scan_only=true` for the actionable batch),
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
 `GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
 `GET /api/paper/performance`, `GET /api/alerts/deliveries`, and
 `POST /api/paper/recommendations/{id}/approve`.
+
+The candidate API and dashboard retain the newest analysis for every market observed across
+rotating scan batches. Each row displays its analysis age. Paper matching and recommendations use
+only the current hourly batch, so an older eligible result remains visible but cannot be approved.
 
 ## Paper positions
 

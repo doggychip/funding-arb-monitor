@@ -1,6 +1,6 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -164,3 +164,39 @@ def test_shadow_workflow_auto_opens_simulated_position(tmp_path, monkeypatch) ->
     position = store.open_paper_positions()[0]
     assert position["notes"] == "Auto-opened by the shadow paper scheduler."
     assert "Shadow paper position opened" in alerts[0]
+
+
+def test_matcher_ignores_an_eligible_market_from_an_older_scan(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    seed_candidate(store)
+    store.save_candidates(
+        [
+            Candidate(
+                dex="(main)",
+                coin="CURRENT",
+                side="short_perp_long_hedge",
+                history_hours=168,
+                open_interest_usd=2_000_000,
+                day_volume_usd=1_000_000,
+                current_apr_pct=5,
+                realized_apr_pct=5,
+                realized_7d_apr_pct=5,
+                realized_24h_apr_pct=5,
+                estimated_net_7d_apr_pct=-20,
+                hedge_assessment="24h_crypto_hedge_venue_and_liquidity_review",
+                negative_hour_share_pct=0,
+                peak_decay_halflife_hours=None,
+                eligible=False,
+                reasons=("7d_realized_apr_below_threshold",),
+                analyzed_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            )
+        ]
+    )
+    matcher = PaperMatcher(
+        store,
+        venues=[FakeVenue()],  # type: ignore[list-item]
+        perp_client=FakePerpClient(),  # type: ignore[arg-type]
+    )
+
+    assert matcher.recommend() == []

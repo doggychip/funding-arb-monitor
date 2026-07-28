@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi.testclient import TestClient
 
 from funding_arb_monitor.api import create_app
@@ -106,3 +108,67 @@ def test_candidates_can_be_filtered_to_eligible_only(tmp_path) -> None:
 
     assert response.status_code == 200
     assert [candidate["coin"] for candidate in response.json()] == ["PASS"]
+
+
+def test_candidates_return_the_newest_analysis_for_every_market(tmp_path) -> None:
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    common = {
+        "dex": "(main)",
+        "side": "short_perp_long_hedge",
+        "history_hours": 168,
+        "open_interest_usd": 2_000_000,
+        "day_volume_usd": 1_000_000,
+        "current_apr_pct": 20.0,
+        "realized_apr_pct": 20.0,
+        "realized_7d_apr_pct": 20.0,
+        "realized_24h_apr_pct": 20.0,
+        "estimated_net_7d_apr_pct": 10.0,
+        "hedge_assessment": "review",
+        "negative_hour_share_pct": 0.0,
+        "peak_decay_halflife_hours": None,
+        "eligible": False,
+        "reasons": ("rejected",),
+    }
+    first_scan = datetime(2026, 7, 28, 1, tzinfo=timezone.utc)
+    second_scan = datetime(2026, 7, 28, 2, tzinfo=timezone.utc)
+    store.save_candidates(
+        [
+            Candidate(coin="ROTATED", analyzed_at=first_scan, **common),
+            Candidate(coin="UPDATED", analyzed_at=first_scan, **common),
+        ]
+    )
+    store.save_candidates(
+        [
+            Candidate(
+                coin="UPDATED",
+                analyzed_at=second_scan,
+                current_apr_pct=30.0,
+                **{key: value for key, value in common.items() if key != "current_apr_pct"},
+            )
+        ]
+    )
+    client = TestClient(create_app(db_path))
+
+    all_markets = client.get("/api/candidates?limit=500").json()
+    current_batch = client.get(
+        "/api/candidates?limit=500&current_scan_only=true"
+    ).json()
+
+    assert {candidate["coin"] for candidate in all_markets} == {
+        "ROTATED",
+        "UPDATED",
+    }
+    updated = next(candidate for candidate in all_markets if candidate["coin"] == "UPDATED")
+    assert updated["current_apr_pct"] == 30.0
+    assert [candidate["coin"] for candidate in current_batch] == ["UPDATED"]
+
+
+def test_dashboard_labels_candidate_analysis_age(tmp_path) -> None:
+    client = TestClient(create_app(str(tmp_path / "test.db")))
+
+    dashboard = client.get("/")
+
+    assert dashboard.status_code == 200
+    assert "Analysis age" in dashboard.text

@@ -76,7 +76,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def candidates(
         limit: int = Query(default=100, ge=1, le=500),
         eligible_only: bool = False,
+        current_scan_only: bool = False,
     ) -> list[dict[str, object]]:
+        if current_scan_only:
+            return store.latest_scan_candidates(limit, eligible_only=eligible_only)
         return store.latest_candidates(limit, eligible_only=eligible_only)
 
     @app.get("/api/status")
