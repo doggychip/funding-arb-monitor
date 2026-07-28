@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -116,7 +117,8 @@ def download_backup(
             is_valid = False
         if not is_valid:
             raise RuntimeError("downloaded backup integrity check failed")
-        partial.replace(destination)
+        os.link(partial, destination)
+        partial.unlink()
         return destination
     except BaseException:
         partial.unlink(missing_ok=True)

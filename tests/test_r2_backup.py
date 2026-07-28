@@ -126,6 +126,35 @@ def test_download_backup_refuses_existing_destination(tmp_path: Path) -> None:
     assert destination.read_text() == "keep me"
 
 
+def test_download_backup_does_not_overwrite_destination_created_during_download(
+    tmp_path: Path,
+) -> None:
+    source = Store(tmp_path / "source.db")
+    source.initialize()
+    payload = source.path.read_bytes()
+    destination = tmp_path / "restore.db"
+
+    class DestinationAppearingBody(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            destination.write_bytes(b"live database")
+            return super().read(size)
+
+    client = FakeS3Client(
+        objects={
+            KEY: {
+                "Body": DestinationAppearingBody(payload),
+                "Metadata": {"sha256": hashlib.sha256(payload).hexdigest()},
+            }
+        }
+    )
+
+    with pytest.raises(FileExistsError):
+        download_backup(KEY, destination, CONFIG, client=client)
+
+    assert destination.read_bytes() == b"live database"
+    assert not destination.with_name("restore.db.part").exists()
+
+
 def test_download_backup_removes_partial_when_checksum_metadata_missing(tmp_path: Path) -> None:
     destination = tmp_path / "restore.db"
     body = io.BytesIO(b"payload")
