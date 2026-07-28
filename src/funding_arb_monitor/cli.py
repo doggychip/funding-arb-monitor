@@ -17,6 +17,7 @@ from .hyperliquid import HyperliquidClient
 from .matcher import PaperMatcher
 from .maintenance import backup_database, integrity_check
 from .paper import PaperLedger, PaperOpenRequest
+from .r2_backup import download_backup, r2_config_from_env, upload_backup
 from .scanner import ScanConfig, Scanner
 from .store import Store
 from .tracker import PaperPositionTracker
@@ -77,6 +78,11 @@ def parser() -> argparse.ArgumentParser:
         "backup", help="create and verify an online SQLite backup"
     )
     backup.add_argument("--destination")
+    download = maintenance_commands.add_parser(
+        "download", help="download and verify an R2 SQLite backup"
+    )
+    download.add_argument("--key", required=True)
+    download.add_argument("--destination", required=True)
     return command
 
 
@@ -90,11 +96,18 @@ def main() -> None:
 
     store = Store(Path(args.db))
     if args.command == "maintenance":
+        config = r2_config_from_env(os.environ)
         if args.maintenance_command == "check":
             result = integrity_check(store.path)
             print(f"integrity={result}")
             if result != "ok":
                 raise SystemExit(1)
+            return
+        if args.maintenance_command == "download":
+            if config is None:
+                raise SystemExit("R2 configuration is required for download")
+            restored = download_backup(args.key, Path(args.destination), config)
+            print(f"download={restored}")
             return
         destination_dir = Path(
             args.destination
@@ -102,7 +115,10 @@ def main() -> None:
         )
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         destination = destination_dir / f"{store.path.stem}-{timestamp}.db"
-        print(f"backup={backup_database(store.path, destination)}")
+        backup_path = backup_database(store.path, destination)
+        print(f"backup={backup_path}")
+        if config is not None:
+            print(f"remote_backup={upload_backup(backup_path, config)}")
         return
 
     store.initialize()

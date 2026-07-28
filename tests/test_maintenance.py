@@ -1,8 +1,12 @@
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
+import funding_arb_monitor.cli as cli
+from funding_arb_monitor.cli import main, parser
 from funding_arb_monitor.maintenance import backup_database, integrity_check
+from funding_arb_monitor.r2_backup import R2Config
 from funding_arb_monitor.store import Store
 
 
@@ -81,3 +85,138 @@ def test_maintenance_cli_checks_and_backs_up_database(tmp_path) -> None:
     backup_path = destination / backed_up.stdout.strip().removeprefix("backup=")
     assert backup_path.exists()
     assert integrity_check(backup_path) == "ok"
+
+
+def test_maintenance_download_requires_key_and_destination() -> None:
+    args = parser().parse_args(
+        [
+            "maintenance",
+            "download",
+            "--key",
+            "funding-arb-monitor/2026/07/28/snapshot.db",
+            "--destination",
+            "/tmp/snapshot.db",
+        ]
+    )
+
+    assert args.maintenance_command == "download"
+    assert args.key.endswith("snapshot.db")
+
+
+def test_local_backup_does_not_upload_without_r2_configuration(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    source = Store(tmp_path / "source.db")
+    source.initialize()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "funding-arb-monitor",
+            "--db",
+            str(source.path),
+            "maintenance",
+            "backup",
+            "--destination",
+            str(tmp_path / "backups"),
+        ],
+    )
+    monkeypatch.setattr("funding_arb_monitor.cli.os.environ", {})
+
+    main()
+
+    assert capsys.readouterr().out.startswith("backup=")
+
+
+def test_configured_backup_uploads_verified_local_backup(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    source = Store(tmp_path / "source.db")
+    source.initialize()
+    destination = tmp_path / "backups"
+    uploaded: list[tuple[Path, R2Config]] = []
+
+    def upload(path: Path, config: R2Config) -> str:
+        uploaded.append((path, config))
+        return "funding-arb-monitor/2026/07/28/snapshot.db"
+
+    monkeypatch.setattr(cli, "upload_backup", upload, raising=False)
+    monkeypatch.setattr(
+        cli.os,
+        "environ",
+        {
+            "FUNDING_ARB_R2_ACCOUNT_ID": "account",
+            "FUNDING_ARB_R2_ACCESS_KEY_ID": "access",
+            "FUNDING_ARB_R2_SECRET_ACCESS_KEY": "secret",
+            "FUNDING_ARB_R2_BUCKET": "backups",
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "funding-arb-monitor",
+            "--db",
+            str(source.path),
+            "maintenance",
+            "backup",
+            "--destination",
+            str(destination),
+        ],
+    )
+
+    main()
+
+    backup_path = uploaded[0][0]
+    assert capsys.readouterr().out == (
+        f"backup={backup_path}\n"
+        "remote_backup=funding-arb-monitor/2026/07/28/snapshot.db\n"
+    )
+    assert uploaded == [(backup_path, R2Config("account", "access", "secret", "backups"))]
+    assert integrity_check(backup_path) == "ok"
+
+
+def test_maintenance_download_prints_verified_destination(tmp_path, monkeypatch, capsys) -> None:
+    destination = tmp_path / "snapshot.db"
+    downloaded: list[tuple[str, Path, R2Config]] = []
+
+    def download(key: str, path: Path, config: R2Config) -> Path:
+        downloaded.append((key, path, config))
+        path.write_bytes(b"verified backup")
+        return path
+
+    monkeypatch.setattr(cli, "download_backup", download, raising=False)
+    monkeypatch.setattr(
+        cli.os,
+        "environ",
+        {
+            "FUNDING_ARB_R2_ACCOUNT_ID": "account",
+            "FUNDING_ARB_R2_ACCESS_KEY_ID": "access",
+            "FUNDING_ARB_R2_SECRET_ACCESS_KEY": "secret",
+            "FUNDING_ARB_R2_BUCKET": "backups",
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "funding-arb-monitor",
+            "maintenance",
+            "download",
+            "--key",
+            "funding-arb-monitor/2026/07/28/snapshot.db",
+            "--destination",
+            str(destination),
+        ],
+    )
+
+    main()
+
+    assert capsys.readouterr().out == f"download={destination}\n"
+    assert downloaded == [
+        (
+            "funding-arb-monitor/2026/07/28/snapshot.db",
+            destination,
+            R2Config("account", "access", "secret", "backups"),
+        )
+    ]
