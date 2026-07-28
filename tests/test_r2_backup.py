@@ -10,6 +10,7 @@ import pytest
 
 from funding_arb_monitor.r2_backup import (
     R2Config,
+    create_r2_client,
     download_backup,
     remote_object_key,
     r2_config_from_env,
@@ -48,6 +49,32 @@ def test_r2_config_is_optional_only_when_all_values_are_absent() -> None:
                 "FUNDING_ARB_R2_BUCKET": "backups",
             }
         )
+
+
+def test_create_r2_client_uses_cloudflare_endpoint_and_credentials(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+    client = object()
+
+    def create_client(service: str, **kwargs: str) -> object:
+        calls.append((service, kwargs))
+        return client
+
+    monkeypatch.setattr("boto3.client", create_client)
+
+    result = create_r2_client(CONFIG)
+
+    assert result is client
+    assert calls == [
+        (
+            "s3",
+            {
+                "endpoint_url": "https://account.r2.cloudflarestorage.com",
+                "aws_access_key_id": "access",
+                "aws_secret_access_key": "secret",
+                "region_name": "auto",
+            },
+        )
+    ]
 
 
 def test_remote_object_key_uses_utc_date_and_filename(tmp_path: Path) -> None:

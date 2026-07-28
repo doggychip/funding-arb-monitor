@@ -1,7 +1,10 @@
+import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 import funding_arb_monitor.cli as cli
 from funding_arb_monitor.cli import main, parser
@@ -220,3 +223,139 @@ def test_maintenance_download_prints_verified_destination(tmp_path, monkeypatch,
             R2Config("account", "access", "secret", "backups"),
         )
     ]
+
+
+def test_maintenance_download_refuses_absent_live_database_path(
+    tmp_path, monkeypatch
+) -> None:
+    live_database = tmp_path / "data" / "funding_arb.db"
+    downloaded: list[Path] = []
+
+    def download(key: str, path: Path, config: R2Config) -> Path:
+        downloaded.append(path)
+        return path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "download_backup", download)
+    monkeypatch.setattr(
+        cli.os,
+        "environ",
+        {
+            "FUNDING_ARB_R2_ACCOUNT_ID": "account",
+            "FUNDING_ARB_R2_ACCESS_KEY_ID": "access",
+            "FUNDING_ARB_R2_SECRET_ACCESS_KEY": "secret",
+            "FUNDING_ARB_R2_BUCKET": "backups",
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "funding-arb-monitor",
+            "--db",
+            "data/funding_arb.db",
+            "maintenance",
+            "download",
+            "--key",
+            "funding-arb-monitor/2026/07/28/snapshot.db",
+            "--destination",
+            str(live_database),
+        ],
+    )
+
+    assert not live_database.exists()
+    with pytest.raises(SystemExit, match="live database"):
+        main()
+
+    assert downloaded == []
+
+
+def test_partial_r2_configuration_exits_nonzero_without_leaking_credentials(
+    tmp_path,
+) -> None:
+    access_key = "partial-access-key-value"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FUNDING_ARB_R2_ACCOUNT_ID": "account",
+            "FUNDING_ARB_R2_ACCESS_KEY_ID": access_key,
+            "FUNDING_ARB_R2_BUCKET": "backups",
+        }
+    )
+    environment.pop("FUNDING_ARB_R2_SECRET_ACCESS_KEY", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "funding_arb_monitor.cli",
+            "--db",
+            str(tmp_path / "source.db"),
+            "maintenance",
+            "backup",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert access_key not in result.stdout + result.stderr
+
+
+def test_upload_client_failure_exits_nonzero_without_leaking_credentials(
+    tmp_path,
+) -> None:
+    source = Store(tmp_path / "source.db")
+    source.initialize()
+    fake_module_dir = tmp_path / "fake-module"
+    fake_module_dir.mkdir()
+    (fake_module_dir / "boto3.py").write_text(
+        "class FailingClient:\n"
+        "    def put_object(self, **kwargs):\n"
+        "        raise RuntimeError('R2 unavailable')\n"
+        "\n"
+        "def client(*args, **kwargs):\n"
+        "    return FailingClient()\n"
+    )
+    access_key = "upload-access-key-value"
+    secret_key = "upload-secret-key-value"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": os.pathsep.join(
+                filter(
+                    None,
+                    [str(fake_module_dir), environment.get("PYTHONPATH", "")],
+                )
+            ),
+            "FUNDING_ARB_R2_ACCOUNT_ID": "account",
+            "FUNDING_ARB_R2_ACCESS_KEY_ID": access_key,
+            "FUNDING_ARB_R2_SECRET_ACCESS_KEY": secret_key,
+            "FUNDING_ARB_R2_BUCKET": "backups",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "funding_arb_monitor.cli",
+            "--db",
+            str(source.path),
+            "maintenance",
+            "backup",
+            "--destination",
+            str(tmp_path / "backups"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "R2 unavailable" in result.stderr
+    assert access_key not in result.stdout + result.stderr
+    assert secret_key not in result.stdout + result.stderr

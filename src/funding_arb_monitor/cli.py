@@ -96,6 +96,11 @@ def main() -> None:
 
     store = Store(Path(args.db))
     if args.command == "maintenance":
+        if (
+            args.maintenance_command == "download"
+            and Path(args.destination).resolve() == store.path.resolve()
+        ):
+            raise SystemExit("download destination must not be the live database path")
         config = r2_config_from_env(os.environ)
         if args.maintenance_command == "check":
             result = integrity_check(store.path)
