@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import shutil
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+
+from funding_arb_monitor.maintenance import integrity_check
 
 
 @dataclass(frozen=True)
@@ -78,3 +83,44 @@ def upload_backup(
             Metadata={"sha256": sha256_file(path)},
         )
     return object_key
+
+
+def download_backup(
+    key: str,
+    destination: Path,
+    config: R2Config,
+    client: Any | None = None,
+) -> Path:
+    if destination.exists():
+        raise FileExistsError(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f"{destination.name}.part")
+    if partial.exists():
+        raise FileExistsError(partial)
+
+    s3 = client or create_r2_client(config)
+    body: Any | None = None
+    try:
+        response = s3.get_object(Bucket=config.bucket, Key=key)
+        body = response["Body"]
+        expected = response.get("Metadata", {}).get("sha256")
+        if not expected:
+            raise RuntimeError("remote backup has no sha256 metadata")
+        with partial.open("xb") as target:
+            shutil.copyfileobj(body, target)
+        if not hmac.compare_digest(sha256_file(partial), expected):
+            raise RuntimeError("remote backup checksum mismatch")
+        try:
+            is_valid = integrity_check(partial) == "ok"
+        except sqlite3.DatabaseError:
+            is_valid = False
+        if not is_valid:
+            raise RuntimeError("downloaded backup integrity check failed")
+        partial.replace(destination)
+        return destination
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    finally:
+        if body is not None and hasattr(body, "close"):
+            body.close()
