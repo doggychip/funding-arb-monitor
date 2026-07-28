@@ -177,9 +177,20 @@ Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
    for the token and stores it in browser session storage. `/`, `/healthz`, and sanitized
    `/readyz` remain public.
 5. Set `FUNDING_ARB_DISCORD_WEBHOOK_URL` to enable operational paper-trading alerts.
-6. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
-7. Keep the Git trigger on `main`.
-8. Generate a Zeabur domain after `/healthz` passes. Monitor `/readyz` separately; it returns
+6. Configure the following protected variables for offsite backups:
+
+   ```text
+   FUNDING_ARB_R2_ACCOUNT_ID
+   FUNDING_ARB_R2_ACCESS_KEY_ID
+   FUNDING_ARB_R2_SECRET_ACCESS_KEY
+   FUNDING_ARB_R2_BUCKET
+   ```
+
+   Create a private Cloudflare R2 bucket, then create an object read/write token scoped only to
+   that bucket. Set a 30-day object-expiration lifecycle rule on the bucket.
+7. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
+8. Keep the Git trigger on `main`.
+9. Generate a Zeabur domain after `/healthz` passes. Monitor `/readyz` separately; it returns
    unavailable until a successful scan has completed within the last two hours and the latest
    persisted scheduler outcomes are healthy.
 
@@ -198,20 +209,28 @@ because the previous version ignores these additive tables and columns.
 
 SQLite connections enable WAL, foreign keys, and a five-second busy timeout. The embedded
 scheduler creates a verified online backup each day under `/data/backups`; override the directory
-with `FUNDING_ARB_BACKUP_DIR`. Copy backups to storage outside the Zeabur volume according to your
-retention policy, because local backups do not survive deletion of the volume.
+with `FUNDING_ARB_BACKUP_DIR`. With all four R2 variables configured, each verified backup is also
+uploaded to R2. Local backups do not survive deletion of the Zeabur volume.
 
 ```bash
 funding-arb-monitor maintenance check
-funding-arb-monitor maintenance backup --destination /data/backups
+funding-arb-monitor maintenance backup
 
-# Restore drill: verify first, stop the service, preserve the current DB, then replace it.
-funding-arb-monitor --db /data/backups/funding_arb-YYYYMMDDTHHMMSSZ.db maintenance check
+# Restore drill: download and verify to a path outside the live database.
+funding-arb-monitor maintenance download \
+  --key funding-arb-monitor/YYYY/MM/DD/funding_arb-YYYYMMDDTHHMMSSZ.db \
+  --destination /data/restore-drills/funding_arb-YYYYMMDDTHHMMSSZ.db
+funding-arb-monitor \
+  --db /data/restore-drills/funding_arb-YYYYMMDDTHHMMSSZ.db \
+  maintenance check
+
+# Only after a successful drill: stop the service, preserve the current DB, then replace it.
 cp /data/funding_arb.db /data/funding_arb.pre-restore.db
-cp /data/backups/funding_arb-YYYYMMDDTHHMMSSZ.db /data/funding_arb.db
+cp /data/restore-drills/funding_arb-YYYYMMDDTHHMMSSZ.db /data/funding_arb.db
 ```
 
-Never overwrite the live database while the API or scheduler is running.
+The service must be stopped before explicitly replacing `/data/funding_arb.db`; never overwrite the
+live database while the API or scheduler is running.
 
 ## Continuous verification
 

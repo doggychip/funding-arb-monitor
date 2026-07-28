@@ -35,6 +35,13 @@ done
 curl -fsS -D - -o /dev/null "http://127.0.0.1:${host_port}/" | grep -qi '^x-content-type-options: nosniff'
 curl -fsS -D - -o /dev/null "http://127.0.0.1:${host_port}/api/status" | grep -qi '^cache-control: no-store'
 docker exec "$container_name" funding-arb-monitor maintenance check | grep -qx 'integrity=ok'
-backup_output="$(docker exec "$container_name" funding-arb-monitor maintenance backup)"
+backup_output="$(
+  docker exec \
+    -e FUNDING_ARB_R2_ACCOUNT_ID= \
+    -e FUNDING_ARB_R2_ACCESS_KEY_ID= \
+    -e FUNDING_ARB_R2_SECRET_ACCESS_KEY= \
+    -e FUNDING_ARB_R2_BUCKET= \
+    "$container_name" funding-arb-monitor maintenance backup
+)"
 backup_path="${backup_output#backup=}"
 docker exec "$container_name" funding-arb-monitor --db "$backup_path" maintenance check | grep -qx 'integrity=ok'
