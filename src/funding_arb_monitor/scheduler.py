@@ -27,6 +27,7 @@ JOBS = (
     ScheduledJob("update", 12, ("paper", "update")),
     ScheduledJob("report", 15, ("paper", "report"), hour=17),
     ScheduledJob("heartbeat", 16, ("paper", "heartbeat"), hour=17),
+    ScheduledJob("backup", 20, ("maintenance", "backup"), hour=17),
 )
 
 
@@ -52,6 +53,9 @@ def execute_job(job: ScheduledJob, database_path: str, store: Store) -> int:
         database_path,
         *job.command,
     ]
+    job_run_id = store.start_scheduled_job(
+        job.name, datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M")
+    )
     print(f"scheduler: starting {job.name}", flush=True)
     try:
         result = subprocess.run(command, timeout=45 * 60, check=False)
@@ -67,6 +71,15 @@ def execute_job(job: ScheduledJob, database_path: str, store: Store) -> int:
                 store=store,
                 event_type=f"scheduler_{job.name}_failed",
             )
+        store.finish_scheduled_job(
+            job_run_id,
+            exit_code=result.returncode,
+            error=(
+                f"process exited with code {result.returncode}"
+                if result.returncode
+                else None
+            ),
+        )
         return result.returncode
     except subprocess.TimeoutExpired:
         print(f"scheduler: timed out {job.name}", flush=True)
@@ -74,6 +87,9 @@ def execute_job(job: ScheduledJob, database_path: str, store: Store) -> int:
             render_scheduler_failure(job.name, "timed out after 45 minutes"),
             store=store,
             event_type=f"scheduler_{job.name}_timed_out",
+        )
+        store.finish_scheduled_job(
+            job_run_id, exit_code=124, error="timed out after 45 minutes"
         )
         return 124
 

@@ -226,6 +226,18 @@
     const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     })[char]);
+    async function apiFetch(url) {
+      let readToken = sessionStorage.getItem("funding-arb-read-token");
+      let response = await fetch(url, {
+        headers: readToken ? { "X-Read-Token": readToken } : {}
+      });
+      if (response.status !== 401) return response;
+      sessionStorage.removeItem("funding-arb-read-token");
+      readToken = prompt("Enter the read-access token");
+      if (!readToken) return response;
+      sessionStorage.setItem("funding-arb-read-token", readToken);
+      return fetch(url, { headers: { "X-Read-Token": readToken } });
+    }
 
     function render() {
       const search = document.querySelector("#search").value.toLowerCase().trim();
@@ -248,7 +260,7 @@
           <td>${row.negative_hour_share_pct.toFixed(1)}%</td>
           <td>${money.format(row.open_interest_usd)}</td>
           <td title="${escapeHtml(new Date(row.analyzed_at).toLocaleString())}">${analysisAge(row.analyzed_at)}</td>
-          <td><span class="badge ${row.eligible && isCurrentAnalysis(row) ? "eligible" : "review"}">${escapeHtml(reasons(row))}</span></td>
+          <td><span class="badge ${row.actionable_now ? "eligible" : "review"}">${escapeHtml(row.actionable_now ? "actionable now" : reasons(row))}</span></td>
         </tr>
       `).join("");
       document.querySelector("#empty").style.display = candidates.length === 0 ? "block" : "none";
@@ -258,16 +270,16 @@
       const meta = document.querySelector("#scan-meta");
       meta.textContent = "Loading latest persisted scan…";
       try {
-        const response = await fetch("/api/candidates?limit=500");
+        const response = await apiFetch("/api/candidates?limit=500");
         if (!response.ok) throw new Error("API request failed");
         candidates = await response.json();
-        const currentResponse = await fetch("/api/candidates?limit=500&current_scan_only=true");
+        const currentResponse = await apiFetch("/api/candidates?limit=500&current_scan_only=true");
         if (!currentResponse.ok) throw new Error("Current scan API request failed");
         currentCandidates = await currentResponse.json();
         const eligible = currentCandidates.filter((row) => row.eligible);
         const best = [...currentCandidates].sort((a, b) => (b.realized_7d_apr_pct ?? -Infinity) - (a.realized_7d_apr_pct ?? -Infinity))[0];
         const analyzedAt = currentCandidates[0]?.analyzed_at;
-        const statusResponse = await fetch("/api/status");
+        const statusResponse = await apiFetch("/api/status");
         const scanStatus = statusResponse.ok ? await statusResponse.json() : null;
         document.querySelector("#candidate-count").textContent = candidates.length;
         document.querySelector("#eligible-count").textContent = eligible.length;
@@ -289,12 +301,12 @@
     }
 
     async function loadRecommendations() {
-      const response = await fetch("/api/paper/recommendations");
+      const response = await apiFetch("/api/paper/recommendations");
       const recommendations = response.ok ? await response.json() : [];
       const pendingByCoin = new Map(
         recommendations.filter((item) => item.status === "pending").map((item) => [item.coin, item])
       );
-      const checksResponse = await fetch("/api/paper/match-checks");
+      const checksResponse = await apiFetch("/api/paper/match-checks");
       const checks = checksResponse.ok ? await checksResponse.json() : [];
       const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
       const ideas = currentCandidates.filter((item) => item.eligible);
@@ -348,7 +360,7 @@
     }
 
     async function loadPaper() {
-      const response = await fetch("/api/paper/positions?include_closed=true");
+      const response = await apiFetch("/api/paper/positions?include_closed=true");
       const positions = response.ok ? await response.json() : [];
       document.querySelector("#paper-rows").innerHTML = positions.map((position) => {
         const liquidityWarning = position.closed_at_ms == null && position.liquidity_degraded;
@@ -418,7 +430,7 @@
     }
 
     async function loadTimeline(positionId) {
-      const response = await fetch(`/api/paper/positions/${positionId}/timeline`);
+      const response = await apiFetch(`/api/paper/positions/${positionId}/timeline`);
       if (!response.ok) return;
       const timeline = await response.json();
       const position = timeline.position;
@@ -439,7 +451,7 @@
     }
 
     async function loadPerformance() {
-      const response = await fetch("/api/paper/performance");
+      const response = await apiFetch("/api/paper/performance");
       if (!response.ok) return;
       const performance = await response.json();
       document.querySelector("#completed-trades").textContent = performance.completed_trades;

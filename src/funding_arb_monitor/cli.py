@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .alerts import (
@@ -14,6 +15,7 @@ from .alerts import (
 from .api import create_app
 from .hyperliquid import HyperliquidClient
 from .matcher import PaperMatcher
+from .maintenance import backup_database, integrity_check
 from .paper import PaperLedger, PaperOpenRequest
 from .scanner import ScanConfig, Scanner
 from .store import Store
@@ -64,6 +66,17 @@ def parser() -> argparse.ArgumentParser:
     paper_commands.add_parser("report", help="print paper-position performance")
     paper_commands.add_parser("heartbeat", help="send the daily Discord status heartbeat")
     paper_commands.add_parser("alert-test", help="send a Discord configuration test")
+    maintenance = subcommands.add_parser(
+        "maintenance", help="check or back up the SQLite database"
+    )
+    maintenance_commands = maintenance.add_subparsers(
+        dest="maintenance_command", required=True
+    )
+    maintenance_commands.add_parser("check", help="run SQLite integrity_check")
+    backup = maintenance_commands.add_parser(
+        "backup", help="create and verify an online SQLite backup"
+    )
+    backup.add_argument("--destination")
     return command
 
 
@@ -76,6 +89,22 @@ def main() -> None:
         return
 
     store = Store(Path(args.db))
+    if args.command == "maintenance":
+        if args.maintenance_command == "check":
+            result = integrity_check(store.path)
+            print(f"integrity={result}")
+            if result != "ok":
+                raise SystemExit(1)
+            return
+        destination_dir = Path(
+            args.destination
+            or os.getenv("FUNDING_ARB_BACKUP_DIR", str(store.path.parent / "backups"))
+        )
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = destination_dir / f"{store.path.stem}-{timestamp}.db"
+        print(f"backup={backup_database(store.path, destination)}")
+        return
+
     store.initialize()
     if args.command == "paper":
         ledger = PaperLedger(store)

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
-from datetime import datetime
 
 from .alerts import render_shadow_entry, send_discord_alert
 from .costs import CostAssumptions
 from .hyperliquid import HyperliquidClient
+from .models import PerpQuote
 from .store import Store
 from .venues import (
     BinanceSpot,
@@ -70,30 +70,37 @@ class PaperMatcher:
                     gross_apr=gross_apr,
                 )
                 continue
-            snapshot = self.store.latest_market_snapshot(coin)
-            if snapshot is None:
+            candidate_dex = str(candidate["dex"])
+            try:
+                perp_quote = self.perp_client.perp_quote(
+                    coin, candidate_dex, self.notional_usd
+                )
+            except RuntimeError:
+                perp_quote = None
+            if perp_quote is None:
                 self._record_check(
                     analyzed_at,
                     coin,
-                    "missing_perp_snapshot",
-                    "no current perp mark",
+                    "insufficient_perp_depth",
+                    "no executable two-sided perp quote",
                     quote=quote,
                     gross_apr=gross_apr,
                 )
                 continue
-            captured_at = datetime.fromisoformat(str(snapshot["captured_at"])).timestamp()
-            if time.time() - captured_at > self.max_snapshot_age_seconds:
+            if (
+                int(time.time() * 1000) - perp_quote.captured_at_ms
+                > self.max_snapshot_age_seconds * 1000
+            ):
                 self._record_check(
                     analyzed_at,
                     coin,
-                    "stale_perp_snapshot",
-                    f"perp snapshot is older than {self.max_snapshot_age_seconds // 60} minutes",
+                    "stale_perp_quote",
+                    f"perp quote is older than {self.max_snapshot_age_seconds // 60} minutes",
                     quote=quote,
                     gross_apr=gross_apr,
                 )
                 continue
             now_ms = int(time.time() * 1000)
-            perp_price = float(snapshot["mark_price"])
             recommendation = {
                 "created_at_ms": now_ms,
                 "expires_at_ms": now_ms + 3_600_000,
@@ -101,7 +108,7 @@ class PaperMatcher:
                 "coin": candidate["coin"],
                 "candidate_analyzed_at": candidate["analyzed_at"],
                 "side": candidate["side"],
-                **self._execution(gross_apr, quote, perp_price),
+                **self._execution(gross_apr, quote, perp_quote),
             }
             recommendation_id = self.store.save_paper_recommendation(recommendation)
             if recommendation_id is not None:
@@ -182,12 +189,19 @@ class PaperMatcher:
                 f"executable net APR is now {net_apr:.1f}% < {self.min_net_apr_pct:.1f}%"
             )
         try:
-            snapshot = self.perp_client.market_snapshot(coin, str(candidate["dex"]))
+            perp_quote = self.perp_client.perp_quote(
+                coin, str(candidate["dex"]), self.notional_usd
+            )
         except RuntimeError as exc:
             raise ValueError(f"perp requote failed: {exc}") from exc
-        if snapshot is None:
-            raise ValueError("perp market is no longer available")
-        execution = self._execution(gross_apr, quote, snapshot.mark_price)
+        if perp_quote is None:
+            raise ValueError("perp depth is insufficient for the requested notional")
+        if (
+            int(time.time() * 1000) - perp_quote.captured_at_ms
+            > self.max_snapshot_age_seconds * 1000
+        ):
+            raise ValueError("perp quote is stale")
+        execution = self._execution(gross_apr, quote, perp_quote)
         position_id = self.store.approve_paper_recommendation(
             recommendation_id,
             max_open_positions=self.max_open_positions,
@@ -215,14 +229,19 @@ class PaperMatcher:
         return gross_apr - annualized_cost_pct - self.costs.annual_borrow_pct
 
     def _execution(
-        self, gross_apr: float, quote: HedgeQuote, perp_price: float
+        self, gross_apr: float, quote: HedgeQuote, perp_quote: PerpQuote
     ) -> dict[str, object]:
+        perp_price = perp_quote.executable_sell_price
         return {
             "venue": quote.venue,
             "hedge_symbol": quote.symbol,
             "notional_usd": self.notional_usd,
             "quantity": self.notional_usd / perp_price,
             "perp_entry_price": perp_price,
+            "perp_bid_depth_usd": perp_quote.bid_depth_usd,
+            "perp_ask_depth_usd": perp_quote.ask_depth_usd,
+            "perp_spread_bps": perp_quote.spread_bps,
+            "perp_quote_at_ms": perp_quote.captured_at_ms,
             "hedge_entry_price": quote.executable_buy_price,
             "gross_apr_pct": gross_apr,
             "executable_net_apr_pct": self._net_apr(gross_apr, quote),

@@ -30,6 +30,12 @@ Binance prefer USDC books, then USDT; stablecoin basis/depeg risk is not modeled
 (`xyz:*`) usually fail exact-spot matching and are not a 24/7 delta-neutral arb when the cash
 market is shut. FX, session gaps, and your own market impact are still out of scope.
 
+Paper entry and approval also fetch the public Hyperliquid L2 book and use bid-side VWAP for the
+simulated short-perp fill. A missing, stale, or undersized two-sided perp book is rejected. Quote
+depth, spread, and capture time are retained with the recommendation. The simulation still cannot
+reproduce leg latency, partial fills, exchange outages, or stablecoin basis, so its result is
+evidence—not a guarantee of live execution.
+
 ## Run locally
 
 ```bash
@@ -50,6 +56,7 @@ docs remain at http://127.0.0.1:8080/docs.
 
 Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/candidates`
 (add `?eligible_only=true` to filter or `?current_scan_only=true` for the actionable batch),
+`GET /api/opportunities/actionable`,
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
 `GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
 `GET /api/paper/performance`, `GET /api/alerts/deliveries`, and
@@ -58,6 +65,10 @@ Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/ca
 The candidate API and dashboard retain the newest analysis for every market observed across
 rotating scan batches. Each row displays its analysis age. Paper matching and recommendations use
 only the current hourly batch, so an older eligible result remains visible but cannot be approved.
+Every candidate includes `scan_id`, `analysis_age_seconds`, and `actionable_now`.
+`/api/opportunities/actionable` is the machine-consumption endpoint: it returns only eligible rows
+attached to the latest successful scan. Historical eligibility must never be treated as an order
+signal.
 
 ## Paper positions
 
@@ -162,10 +173,15 @@ Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
 3. Set `FUNDING_ARB_APPROVAL_TOKEN` to a random secret. The dashboard asks for it only when
    approving a paper recommendation; read-only pages remain public. Paper approval is disabled
    when this variable is absent.
-4. Set `FUNDING_ARB_DISCORD_WEBHOOK_URL` to enable operational paper-trading alerts.
-5. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
-6. Generate a Zeabur domain after `/healthz` passes. Monitor `/readyz` separately; it returns
-   unavailable until a successful scan has completed within the last two hours.
+4. Set `FUNDING_ARB_READ_TOKEN` to protect operational `GET /api/*` responses. The dashboard asks
+   for the token and stores it in browser session storage. `/`, `/healthz`, and sanitized
+   `/readyz` remain public.
+5. Set `FUNDING_ARB_DISCORD_WEBHOOK_URL` to enable operational paper-trading alerts.
+6. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
+7. Keep the Git trigger on `main`.
+8. Generate a Zeabur domain after `/healthz` passes. Monitor `/readyz` separately; it returns
+   unavailable until a successful scan has completed within the last two hours and the latest
+   persisted scheduler outcomes are healthy.
 
 The container honors Zeabur's `PORT` variable. Deleting or detaching the `/data` volume deletes
 the SQLite scan and paper-trading history.
@@ -177,6 +193,35 @@ Back up the `/data` volume before deployment. On startup, `Store.initialize()` c
 `paper_positions`. Existing rows and IDs are preserved. Verify `/healthz`, the current paper
 position, and `/api/alerts/deliveries` after deployment. Rolling back the application image is safe
 because the previous version ignores these additive tables and columns.
+
+### Integrity, backup, and restore
+
+SQLite connections enable WAL, foreign keys, and a five-second busy timeout. The embedded
+scheduler creates a verified online backup each day under `/data/backups`; override the directory
+with `FUNDING_ARB_BACKUP_DIR`. Copy backups to storage outside the Zeabur volume according to your
+retention policy, because local backups do not survive deletion of the volume.
+
+```bash
+funding-arb-monitor maintenance check
+funding-arb-monitor maintenance backup --destination /data/backups
+
+# Restore drill: verify first, stop the service, preserve the current DB, then replace it.
+funding-arb-monitor --db /data/backups/funding_arb-YYYYMMDDTHHMMSSZ.db maintenance check
+cp /data/funding_arb.db /data/funding_arb.pre-restore.db
+cp /data/backups/funding_arb-YYYYMMDDTHHMMSSZ.db /data/funding_arb.db
+```
+
+Never overwrite the live database while the API or scheduler is running.
+
+## Continuous verification
+
+GitHub Actions runs the full suite on Python 3.11 and 3.12. The container smoke test builds the
+image, verifies it runs as non-root, starts it with a persistent volume, checks HTTP security
+headers, runs SQLite integrity and backup commands, and validates the restored backup:
+
+```bash
+./scripts/container-smoke.sh
+```
 
 ## Graduation criteria for live trading
 

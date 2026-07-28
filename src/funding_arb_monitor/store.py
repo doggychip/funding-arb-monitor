@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .costs import CostAssumptions
@@ -14,8 +17,11 @@ class Store:
         self.path = Path(path)
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
     def initialize(self) -> None:
@@ -139,6 +145,16 @@ class Store:
                     attempts INTEGER NOT NULL,
                     detail TEXT
                 );
+                CREATE TABLE IF NOT EXISTS scheduled_job_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    scheduled_slot TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    completed_at_ms INTEGER,
+                    status TEXT NOT NULL,
+                    exit_code INTEGER,
+                    error TEXT
+                );
                 """
             )
             self._ensure_column(connection, "paper_positions", "recommendation_id", "INTEGER")
@@ -165,6 +181,11 @@ class Store:
             self._ensure_column(connection, "paper_match_checks", "net_apr_7d_pct", "REAL")
             self._ensure_column(connection, "paper_match_checks", "net_apr_14d_pct", "REAL")
             self._ensure_column(connection, "paper_match_checks", "net_apr_30d_pct", "REAL")
+            self._ensure_column(connection, "candidates", "scan_run_id", "INTEGER")
+            self._ensure_column(connection, "paper_recommendations", "perp_bid_depth_usd", "REAL")
+            self._ensure_column(connection, "paper_recommendations", "perp_ask_depth_usd", "REAL")
+            self._ensure_column(connection, "paper_recommendations", "perp_spread_bps", "REAL")
+            self._ensure_column(connection, "paper_recommendations", "perp_quote_at_ms", "INTEGER")
 
     @staticmethod
     def _ensure_column(
@@ -246,16 +267,23 @@ class Store:
             for row in rows
         ]
 
-    def save_candidates(self, candidates: list[Candidate]) -> None:
+    def save_candidates(
+        self, candidates: list[Candidate], *, scan_run_id: int | None = None
+    ) -> None:
         with self.connect() as connection:
             connection.executemany(
-                "INSERT OR REPLACE INTO candidates VALUES (?, ?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO candidates (
+                    analyzed_at, dex, coin, payload_json, scan_run_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
                 [
                     (
                         item.analyzed_at.isoformat(),
                         item.dex,
                         item.coin,
                         json.dumps(item.as_dict(), separators=(",", ":")),
+                        scan_run_id,
                     )
                     for item in candidates
                 ],
@@ -307,6 +335,138 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
+    def latest_successful_scan_run(self) -> dict[str, object] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM scan_runs
+                WHERE status = 'success'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def start_scheduled_job(self, name: str, scheduled_slot: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO scheduled_job_runs (
+                    name, scheduled_slot, started_at_ms, status
+                ) VALUES (?, ?, ?, 'running')
+                """,
+                (name, scheduled_slot, int(time.time() * 1000)),
+            )
+        return int(cursor.lastrowid)
+
+    def finish_scheduled_job(
+        self, job_run_id: int, *, exit_code: int, error: str | None = None
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE scheduled_job_runs
+                SET completed_at_ms = ?, status = ?, exit_code = ?, error = ?
+                WHERE id = ?
+                """,
+                (
+                    int(time.time() * 1000),
+                    "success" if exit_code == 0 else "failed",
+                    exit_code,
+                    error[:500] if error else None,
+                    job_run_id,
+                ),
+            )
+
+    def scheduled_job_runs(self, limit: int = 100) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM scheduled_job_runs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def scheduler_health(self, *, now_ms: int | None = None) -> dict[str, object]:
+        current_ms = now_ms or int(time.time() * 1000)
+        max_age_ms = {
+            "scan": 2 * 3_600_000,
+            "shadow": 2 * 3_600_000,
+            "accrue": 2 * 3_600_000,
+            "update": 2 * 3_600_000,
+            "report": 26 * 3_600_000,
+            "heartbeat": 26 * 3_600_000,
+            "backup": 26 * 3_600_000,
+        }
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                WITH latest AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY name ORDER BY id DESC
+                    ) AS recency_rank
+                    FROM scheduled_job_runs
+                )
+                SELECT * FROM latest
+                WHERE recency_rank = 1
+                ORDER BY name
+                """
+            ).fetchall()
+        unhealthy: list[str] = []
+        latest: list[dict[str, object]] = []
+        for row in rows:
+            item = dict(row)
+            latest.append(item)
+            name = str(row["name"])
+            if row["status"] != "success":
+                unhealthy.append(f"{name}:{row['status']}")
+                continue
+            completed_at_ms = row["completed_at_ms"]
+            if (
+                completed_at_ms is not None
+                and name in max_age_ms
+                and current_ms - int(completed_at_ms) > max_age_ms[name]
+            ):
+                unhealthy.append(f"{name}:overdue")
+        return {
+            "healthy": not unhealthy,
+            "unhealthy_jobs": unhealthy,
+            "latest_jobs": latest,
+        }
+
+    def unhealthy_scheduled_jobs(self) -> list[str]:
+        return list(self.scheduler_health()["unhealthy_jobs"])
+
+    def database_health(self) -> dict[str, object]:
+        minimum_free_bytes = int(
+            os.getenv("FUNDING_ARB_MIN_FREE_BYTES", str(10 * 1024 * 1024))
+        )
+        try:
+            with self.connect() as connection:
+                integrity = str(
+                    connection.execute("PRAGMA quick_check").fetchone()[0]
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+            free_bytes = shutil.disk_usage(self.path.parent).free
+        except (OSError, sqlite3.Error) as exc:
+            return {
+                "healthy": False,
+                "integrity": "unavailable",
+                "writable": False,
+                "free_bytes": 0,
+                "error": str(exc)[:200],
+            }
+        return {
+            "healthy": integrity == "ok" and free_bytes >= minimum_free_bytes,
+            "integrity": integrity,
+            "writable": True,
+            "free_bytes": free_bytes,
+        }
+
     def latest_market_snapshot(self, coin: str) -> dict[str, object] | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -333,6 +493,10 @@ class Store:
             "notional_usd",
             "quantity",
             "perp_entry_price",
+            "perp_bid_depth_usd",
+            "perp_ask_depth_usd",
+            "perp_spread_bps",
+            "perp_quote_at_ms",
             "hedge_entry_price",
             "gross_apr_pct",
             "executable_net_apr_pct",
@@ -424,7 +588,9 @@ class Store:
                 """
                 UPDATE paper_recommendations
                 SET venue = ?, hedge_symbol = ?, quantity = ?,
-                    perp_entry_price = ?, hedge_entry_price = ?,
+                    perp_entry_price = ?, perp_bid_depth_usd = ?,
+                    perp_ask_depth_usd = ?, perp_spread_bps = ?,
+                    perp_quote_at_ms = ?, hedge_entry_price = ?,
                     gross_apr_pct = ?, executable_net_apr_pct = ?,
                     hedge_fee_bps = ?, hedge_spread_bps = ?,
                     bid_depth_usd = ?, ask_depth_usd = ?,
@@ -436,6 +602,10 @@ class Store:
                     execution["hedge_symbol"],
                     execution["quantity"],
                     execution["perp_entry_price"],
+                    execution["perp_bid_depth_usd"],
+                    execution["perp_ask_depth_usd"],
+                    execution["perp_spread_bps"],
+                    execution["perp_quote_at_ms"],
                     execution["hedge_entry_price"],
                     execution["gross_apr_pct"],
                     execution["executable_net_apr_pct"],
@@ -574,14 +744,14 @@ class Store:
             rows = connection.execute(
                 f"""
                 WITH ranked AS (
-                    SELECT payload_json,
+                    SELECT payload_json, scan_run_id,
                         ROW_NUMBER() OVER (
                             PARTITION BY dex, coin
                             ORDER BY analyzed_at DESC
                         ) AS recency_rank
                     FROM candidates
                 )
-                SELECT payload_json
+                SELECT payload_json, scan_run_id
                 FROM ranked
                 WHERE recency_rank = 1
                 {eligible_clause}
@@ -590,7 +760,7 @@ class Store:
                 """,
                 (limit,),
             ).fetchall()
-        return [json.loads(row["payload_json"]) for row in rows]
+        return self._candidate_rows(rows)
 
     def latest_scan_candidates(
         self, limit: int = 100, *, eligible_only: bool = False
@@ -603,7 +773,7 @@ class Store:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT payload_json
+                SELECT payload_json, scan_run_id
                 FROM candidates
                 WHERE analyzed_at = (SELECT MAX(analyzed_at) FROM candidates)
                 {eligible_clause}
@@ -612,7 +782,50 @@ class Store:
                 """,
                 (limit,),
             ).fetchall()
-        return [json.loads(row["payload_json"]) for row in rows]
+        return self._candidate_rows(rows)
+
+    def actionable_candidates(self, limit: int = 100) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json, scan_run_id
+                FROM candidates
+                WHERE scan_run_id = (
+                    SELECT id FROM scan_runs
+                    WHERE status = 'success'
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                AND json_extract(payload_json, '$.eligible') = 1
+                ORDER BY json_extract(payload_json, '$.realized_7d_apr_pct') DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return self._candidate_rows(rows)
+
+    def _candidate_rows(
+        self, rows: list[sqlite3.Row]
+    ) -> list[dict[str, object]]:
+        latest_successful_run = self.latest_successful_scan_run()
+        latest_successful_id = (
+            int(latest_successful_run["id"]) if latest_successful_run else None
+        )
+        now = time.time()
+        output: list[dict[str, object]] = []
+        for row in rows:
+            candidate = json.loads(row["payload_json"])
+            scan_id = row["scan_run_id"]
+            analyzed_at = datetime.fromisoformat(str(candidate["analyzed_at"])).timestamp()
+            candidate["scan_id"] = scan_id
+            candidate["analysis_age_seconds"] = max(0, int(now - analyzed_at))
+            candidate["actionable_now"] = bool(
+                candidate.get("eligible")
+                and scan_id is not None
+                and int(scan_id) == latest_successful_id
+            )
+            output.append(candidate)
+        return output
 
     def latest_candidate(self, coin: str) -> dict[str, object] | None:
         with self.connect() as connection:

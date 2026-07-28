@@ -161,7 +161,7 @@ class Scanner:
             )
 
         output.sort(key=lambda item: abs(item.realized_7d_apr_pct or 0), reverse=True)
-        self.store.save_candidates(output)
+        self.store.save_candidates(output, scan_run_id=run_id)
         self.store.finish_scan_run(
             run_id,
             status="partial" if failed_market_count else "success",

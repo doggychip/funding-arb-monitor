@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from funding_arb_monitor.matcher import PaperMatcher
-from funding_arb_monitor.models import Candidate, MarketSnapshot
+from funding_arb_monitor.models import Candidate, MarketSnapshot, PerpQuote
 from funding_arb_monitor.store import Store
 from funding_arb_monitor.venues import HedgeQuote
 
@@ -37,6 +37,7 @@ class FakeVenue:
 class FakePerpClient:
     def __init__(self, mark_price: float = 105) -> None:
         self.mark_price = mark_price
+        self.depth_usd = 20_000
 
     def market_snapshot(self, coin: str, dex: str) -> MarketSnapshot:
         return MarketSnapshot(
@@ -47,6 +48,23 @@ class FakePerpClient:
             1_000_000,
             self.mark_price,
             datetime.now(timezone.utc),
+        )
+
+    def perp_quote(
+        self, coin: str, dex: str, notional_usd: float
+    ) -> PerpQuote | None:
+        if self.depth_usd < notional_usd:
+            return None
+        return PerpQuote(
+            coin=coin,
+            dex=dex,
+            bid=self.mark_price - 1,
+            ask=self.mark_price + 1,
+            executable_sell_price=self.mark_price - 1,
+            executable_buy_price=self.mark_price + 1,
+            bid_depth_usd=self.depth_usd,
+            ask_depth_usd=self.depth_usd,
+            captured_at_ms=int(time.time() * 1000),
         )
 
 
@@ -94,6 +112,10 @@ def test_matcher_requires_approval_before_opening_position(tmp_path) -> None:
 
     assert len(recommendations) == 1
     assert recommendations[0]["executable_net_apr_pct"] == pytest.approx(163.7142857)
+    assert recommendations[0]["perp_entry_price"] == 104
+    assert recommendations[0]["perp_bid_depth_usd"] == 20_000
+    assert recommendations[0]["perp_ask_depth_usd"] == 20_000
+    assert recommendations[0]["perp_quote_at_ms"] > 0
     check = store.latest_paper_match_checks()[0]
     assert check["hedge_venue"] == "coinbase"
     assert check["net_apr_7d_pct"] == pytest.approx(163.7142857)
@@ -114,8 +136,8 @@ def test_matcher_requires_approval_before_opening_position(tmp_path) -> None:
     position = next(item for item in approvals if item is not None)
     assert position["coin"] == "TEST"
     assert position["hedge_venue"] == "coinbase"
-    assert position["perp_entry_price"] == 105
-    assert position["quantity"] == pytest.approx(1_000 / 105)
+    assert position["perp_entry_price"] == 104
+    assert position["quantity"] == pytest.approx(1_000 / 104)
     with pytest.raises(ValueError, match="approved"):
         matcher.approve(recommendation_id)
     assert len(store.open_paper_positions()) == 1
@@ -139,6 +161,25 @@ def test_approval_rejects_deteriorated_spot_depth(tmp_path) -> None:
 
     assert store.open_paper_positions() == []
     assert store.paper_recommendation(recommendation_id)["status"] == "pending"
+
+
+def test_approval_rejects_insufficient_executable_perp_depth(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    seed_candidate(store)
+    perp = FakePerpClient()
+    matcher = PaperMatcher(
+        store,
+        venues=[FakeVenue()],  # type: ignore[list-item]
+        perp_client=perp,  # type: ignore[arg-type]
+    )
+    recommendation_id = matcher.recommend()[0]["id"]
+    perp.depth_usd = 999
+
+    with pytest.raises(ValueError, match="perp depth"):
+        matcher.approve(recommendation_id)
+
+    assert store.open_paper_positions() == []
 
 
 def test_shadow_workflow_auto_opens_simulated_position(tmp_path, monkeypatch) -> None:

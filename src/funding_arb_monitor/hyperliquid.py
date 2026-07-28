@@ -8,7 +8,7 @@ from datetime import datetime
 from email.message import Message
 from typing import Callable
 
-from .models import FundingPoint, MarketSnapshot
+from .models import FundingPoint, MarketSnapshot, PerpQuote
 
 
 class HyperliquidClient:
@@ -148,6 +148,60 @@ class HyperliquidClient:
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError("invalid Hyperliquid market fields") from exc
         return None
+
+    def perp_quote(
+        self, coin: str, dex: str, notional_usd: float
+    ) -> PerpQuote | None:
+        payload: dict[str, object] = {"type": "l2Book", "coin": coin}
+        if dex != "(main)":
+            payload["dex"] = dex
+        data = self.post(payload)
+        try:
+            levels = data["levels"]
+            bids, asks = levels[0], levels[1]
+            bid = float(bids[0]["px"])
+            ask = float(asks[0]["px"])
+            sell_price, bid_depth = self._book_vwap(bids, notional_usd)
+            buy_price, ask_depth = self._book_vwap(asks, notional_usd)
+            captured_at_ms = int(data["time"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid Hyperliquid order book response") from exc
+        if sell_price is None or buy_price is None:
+            return None
+        return PerpQuote(
+            coin=coin,
+            dex=dex,
+            bid=bid,
+            ask=ask,
+            executable_sell_price=sell_price,
+            executable_buy_price=buy_price,
+            bid_depth_usd=bid_depth,
+            ask_depth_usd=ask_depth,
+            captured_at_ms=captured_at_ms,
+        )
+
+    @staticmethod
+    def _book_vwap(
+        levels: list[dict[str, object]], notional_usd: float
+    ) -> tuple[float | None, float]:
+        remaining = notional_usd
+        filled_quantity = 0.0
+        filled_notional = 0.0
+        total_depth = 0.0
+        for level in levels:
+            price = float(level["px"])
+            quantity = float(level["sz"])
+            level_notional = price * quantity
+            total_depth += level_notional
+            take_notional = min(remaining, level_notional)
+            filled_notional += take_notional
+            filled_quantity += take_notional / price
+            remaining -= take_notional
+            if remaining <= 1e-9:
+                break
+        if remaining > 1e-9 or filled_quantity == 0:
+            return None, total_depth
+        return filled_notional / filled_quantity, total_depth
 
     def funding_history(
         self,

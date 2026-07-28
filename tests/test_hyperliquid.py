@@ -79,3 +79,41 @@ def test_market_snapshot_fetches_only_requested_dex() -> None:
     assert snapshot is not None
     assert snapshot.mark_price == 105
     assert snapshot.open_interest_usd == 10_500
+
+
+def test_perp_quote_uses_executable_vwap_for_both_sides() -> None:
+    client = HyperliquidClient()
+    book = {
+        "time": 1_785_212_312_933,
+        "levels": [
+            [{"px": "99", "sz": "6", "n": 2}, {"px": "98", "sz": "10", "n": 3}],
+            [{"px": "101", "sz": "5", "n": 2}, {"px": "102", "sz": "10", "n": 3}],
+        ],
+    }
+
+    with patch.object(client, "post", return_value=book) as post:
+        quote = client.perp_quote("TEST", "(main)", 1_000)
+
+    post.assert_called_once_with({"type": "l2Book", "coin": "TEST"})
+    assert quote is not None
+    assert quote.executable_sell_price == pytest.approx((99 * 6 + 98 * 4.1428571429) / 10.1428571429)
+    assert quote.executable_buy_price == pytest.approx((101 * 5 + 102 * 4.8529411765) / 9.8529411765)
+    assert quote.bid_depth_usd == pytest.approx(1_574)
+    assert quote.ask_depth_usd == pytest.approx(1_525)
+    assert quote.captured_at_ms == 1_785_212_312_933
+
+
+def test_perp_quote_returns_none_when_either_side_cannot_fill_notional() -> None:
+    client = HyperliquidClient()
+    book = {
+        "time": 1,
+        "levels": [
+            [{"px": "99", "sz": "2", "n": 1}],
+            [{"px": "101", "sz": "20", "n": 1}],
+        ],
+    }
+
+    with patch.object(client, "post", return_value=book):
+        quote = client.perp_quote("TEST", "(main)", 1_000)
+
+    assert quote is None

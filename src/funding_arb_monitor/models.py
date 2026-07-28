@@ -30,6 +30,24 @@ class FundingPoint:
 
 
 @dataclass(frozen=True)
+class PerpQuote:
+    coin: str
+    dex: str
+    bid: float
+    ask: float
+    executable_sell_price: float
+    executable_buy_price: float
+    bid_depth_usd: float
+    ask_depth_usd: float
+    captured_at_ms: int
+
+    @property
+    def spread_bps(self) -> float:
+        midpoint = (self.bid + self.ask) / 2
+        return (self.ask - self.bid) / midpoint * 10_000
+
+
+@dataclass(frozen=True)
 class Candidate:
     dex: str
     coin: str
