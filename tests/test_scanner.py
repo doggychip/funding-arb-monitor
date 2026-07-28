@@ -92,3 +92,51 @@ def test_scanner_alerts_on_full_scan_failure(tmp_path, monkeypatch) -> None:
         ).run()
 
     assert "Funding monitor scan failed" in alerts[0]
+
+
+def test_history_selection_keeps_a_current_leader_and_rotates_an_unseen_market(
+    tmp_path,
+) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    store.save_funding([FundingPoint("HOT", 1_000, 0.001)])
+    captured_at = datetime.now(timezone.utc)
+    snapshots = [
+        MarketSnapshot(
+            dex="(main)",
+            coin="HOT",
+            funding_rate=0.001,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+        MarketSnapshot(
+            dex="(main)",
+            coin="UNSEEN_A",
+            funding_rate=0.00001,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+        MarketSnapshot(
+            dex="(main)",
+            coin="UNSEEN_B",
+            funding_rate=0.000005,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+    ]
+    scanner = Scanner(
+        FakeClient(),  # type: ignore[arg-type]
+        store,
+        ScanConfig(max_history_fetches=2),
+    )
+
+    assert [item.coin for item in scanner.select_history_candidates(snapshots)] == [
+        "HOT",
+        "UNSEEN_A",
+    ]

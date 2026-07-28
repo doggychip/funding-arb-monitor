@@ -210,6 +210,22 @@ class Store:
             ).fetchone()
         return int(row["timestamp_ms"]) if row and row["timestamp_ms"] is not None else None
 
+    def latest_funding_timestamps(self, coins: list[str]) -> dict[str, int]:
+        if not coins:
+            return {}
+        placeholders = ", ".join("?" for _ in coins)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT coin, MAX(timestamp_ms) AS timestamp_ms
+                FROM funding_points
+                WHERE coin IN ({placeholders})
+                GROUP BY coin
+                """,
+                coins,
+            ).fetchall()
+        return {str(row["coin"]): int(row["timestamp_ms"]) for row in rows}
+
     def funding_history(self, coin: str, start_time_ms: int) -> list[FundingPoint]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -546,13 +562,21 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def latest_candidates(self, limit: int = 100) -> list[dict[str, object]]:
+    def latest_candidates(
+        self, limit: int = 100, *, eligible_only: bool = False
+    ) -> list[dict[str, object]]:
+        eligible_clause = (
+            "AND json_extract(payload_json, '$.eligible') = 1"
+            if eligible_only
+            else ""
+        )
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT payload_json
                 FROM candidates
                 WHERE analyzed_at = (SELECT MAX(analyzed_at) FROM candidates)
+                {eligible_clause}
                 ORDER BY json_extract(payload_json, '$.realized_7d_apr_pct') DESC
                 LIMIT ?
                 """,

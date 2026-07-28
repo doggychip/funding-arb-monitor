@@ -41,9 +41,25 @@ class Scanner:
             for snapshot in snapshots
             if snapshot.open_interest_usd >= self.config.min_open_interest_usd
         ]
-        return sorted(liquid, key=lambda item: abs(item.current_apr_pct), reverse=True)[
-            : self.config.max_history_fetches
-        ]
+        latest_by_coin = self.store.latest_funding_timestamps(
+            [snapshot.coin for snapshot in liquid]
+        )
+        priority_count = min(
+            len(liquid), max(1, self.config.max_history_fetches // 2)
+        )
+        priority = sorted(
+            liquid, key=lambda item: abs(item.current_apr_pct), reverse=True
+        )[:priority_count]
+        priority_coins = {snapshot.coin for snapshot in priority}
+        rotation = sorted(
+            [snapshot for snapshot in liquid if snapshot.coin not in priority_coins],
+            key=lambda item: (
+                item.coin in latest_by_coin,
+                latest_by_coin.get(item.coin, 0),
+                -abs(item.current_apr_pct),
+            ),
+        )
+        return (priority + rotation)[: self.config.max_history_fetches]
 
     def run(self) -> list[Candidate]:
         self.store.initialize()

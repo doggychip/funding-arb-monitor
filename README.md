@@ -48,7 +48,8 @@ Open http://127.0.0.1:8080 for the local dashboard. It shows scan status, candid
 recommendations, performance, and P&L/basis timelines for open and closed paper positions. FastAPI
 docs remain at http://127.0.0.1:8080/docs.
 
-Useful endpoints: `GET /healthz`, `GET /api/status`, `GET /api/candidates`,
+Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/candidates`
+(add `?eligible_only=true` to filter),
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
 `GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
 `GET /api/paper/performance`, `GET /api/alerts/deliveries`, and
@@ -155,10 +156,12 @@ Deploy the GitHub repository as a service; Zeabur detects the root `Dockerfile`.
 1. Keep the service at one replica so only one scheduler runs.
 2. Add a persistent volume mounted at `/data`.
 3. Set `FUNDING_ARB_APPROVAL_TOKEN` to a random secret. The dashboard asks for it only when
-   approving a paper recommendation; read-only pages remain public.
+   approving a paper recommendation; read-only pages remain public. Paper approval is disabled
+   when this variable is absent.
 4. Set `FUNDING_ARB_DISCORD_WEBHOOK_URL` to enable operational paper-trading alerts.
 5. Keep `FUNDING_ARB_TIMEZONE=Asia/Hong_Kong` (the Docker default), or override it explicitly.
-6. Generate a Zeabur domain after the health check at `/healthz` passes.
+6. Generate a Zeabur domain after `/healthz` passes. Monitor `/readyz` separately; it returns
+   unavailable until a successful scan has completed within the last two hours.
 
 The container honors Zeabur's `PORT` variable. Deleting or detaching the `/data` volume deletes
 the SQLite scan and paper-trading history.

@@ -16,7 +16,13 @@ def realized_apr_pct(rates: RateSeries) -> float | None:
 def rolling_apr_pct(rates: RateSeries, hours: int) -> float | None:
     if len(rates) < hours:
         return None
-    return sum(rate for _, rate in rates[-hours:]) * HOURS_PER_YEAR / hours * 100
+    window = rates[-hours:]
+    if any(
+        not 45 * 60_000 <= later[0] - earlier[0] <= 75 * 60_000
+        for earlier, later in zip(window, window[1:])
+    ):
+        return None
+    return sum(rate for _, rate in window) * HOURS_PER_YEAR / hours * 100
 
 
 def negative_hour_share_pct(rates: RateSeries) -> float | None:

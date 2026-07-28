@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from hmac import compare_digest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -47,9 +48,36 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/readyz")
+    def readyz() -> dict[str, object]:
+        max_scan_age_seconds = int(
+            os.getenv("FUNDING_ARB_MAX_SCAN_AGE_SECONDS", "7200")
+        )
+        try:
+            run = store.latest_scan_run()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="database is unavailable") from exc
+        if (
+            run is None
+            or run["status"] != "success"
+            or run["completed_at_ms"] is None
+            or int(time.time() * 1000) - int(run["completed_at_ms"])
+            > max_scan_age_seconds * 1000
+        ):
+            raise HTTPException(
+                status_code=503, detail="no recent successful scan"
+            )
+        return {
+            "status": "ready",
+            "last_scan_completed_at_ms": run["completed_at_ms"],
+        }
+
     @app.get("/api/candidates")
-    def candidates(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, object]]:
-        return store.latest_candidates(limit)
+    def candidates(
+        limit: int = Query(default=100, ge=1, le=500),
+        eligible_only: bool = False,
+    ) -> list[dict[str, object]]:
+        return store.latest_candidates(limit, eligible_only=eligible_only)
 
     @app.get("/api/status")
     def status() -> dict[str, object]:
@@ -79,14 +107,15 @@ def create_app(database_path: str | None = None) -> FastAPI:
         recommendation_id: int,
         authorization: str | None = Header(default=None),
     ) -> dict[str, object]:
-        if approval_token:
-            supplied_token = (
-                authorization.removeprefix("Bearer ")
-                if authorization and authorization.startswith("Bearer ")
-                else ""
-            )
-            if not compare_digest(supplied_token, approval_token):
-                raise HTTPException(status_code=401, detail="approval token required")
+        if not approval_token:
+            raise HTTPException(status_code=503, detail="paper approval is disabled")
+        supplied_token = (
+            authorization.removeprefix("Bearer ")
+            if authorization and authorization.startswith("Bearer ")
+            else ""
+        )
+        if not compare_digest(supplied_token, approval_token):
+            raise HTTPException(status_code=401, detail="approval token required")
         try:
             return PaperMatcher(store).approve(recommendation_id)
         except ValueError as exc:
