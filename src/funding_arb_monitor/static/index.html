@@ -264,7 +264,7 @@
           <td>${row.negative_hour_share_pct.toFixed(1)}%</td>
           <td>${money.format(row.open_interest_usd)}</td>
           <td title="${escapeHtml(new Date(row.analyzed_at).toLocaleString())}">${analysisAge(row.analyzed_at)}</td>
-          <td><span class="badge ${row.actionable_now ? "eligible" : "review"}">${escapeHtml(row.actionable_now ? "actionable now" : reasons(row))}</span></td>
+          <td><span class="badge ${row.actionable_now ? "eligible" : "review"}">${escapeHtml(row.actionable_now ? "monitoring eligible" : reasons(row))}</span></td>
         </tr>
       `).join("");
       document.querySelector("#empty").style.display = candidates.length === 0 ? "block" : "none";

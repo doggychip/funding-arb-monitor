@@ -26,6 +26,7 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert 'id="stale-market-count"' in dashboard.text
     assert 'id="no-hedge-count"' in dashboard.text
     assert 'id="paper-progress"' in dashboard.text
+    assert "monitoring eligible" in dashboard.text
     assert "Trade recommendations &amp; proposed actions" in dashboard.text
     assert "Monitor only; wait for an exact spot listing" in dashboard.text
     assert client.get("/api/candidates").json() == []
