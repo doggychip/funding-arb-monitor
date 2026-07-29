@@ -21,6 +21,7 @@ from .r2_backup import download_backup, r2_config_from_env, upload_backup
 from .scanner import ScanConfig, Scanner
 from .store import Store
 from .tracker import PaperPositionTracker
+from .venues import public_spot_assets
 
 
 def parser() -> argparse.ArgumentParser:
@@ -31,7 +32,7 @@ def parser() -> argparse.ArgumentParser:
     scan = subcommands.add_parser("scan", help="fetch public data, persist it, and evaluate candidates")
     scan.add_argument("--days", type=int, default=30)
     scan.add_argument("--min-oi", type=float, default=1_000_000)
-    scan.add_argument("--max-history-fetches", type=int, default=40)
+    scan.add_argument("--max-history-fetches", type=int, default=80)
     scan.add_argument("--min-7d-apr", type=float, default=15)
     scan.add_argument("--max-negative-share", type=float, default=25)
     scan.add_argument("--min-day-volume", type=float, default=500_000)
@@ -204,7 +205,12 @@ def main() -> None:
         max_negative_hour_share_pct=args.max_negative_share,
         min_day_volume_usd=args.min_day_volume,
     )
-    results = Scanner(HyperliquidClient(), store, config).run()
+    results = Scanner(
+        HyperliquidClient(),
+        store,
+        config,
+        hedgeable_assets_provider=public_spot_assets,
+    ).run()
     if args.alert:
         delivered = send_webhook(render_alert(results))
         print(f"alert_delivered={delivered}")

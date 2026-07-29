@@ -21,6 +21,9 @@ Hourly runs fetch only funding records newer than the latest stored point. Publi
 are throttled and transient disconnects, HTTP 429 responses, and server errors use bounded
 exponential backoff. If one market still fails, the rest of the scan completes; cached data for
 that market is marked `funding_refresh_failed` and cannot pass the monitoring gates.
+Each run analyzes up to 80 liquid markets. Half of the budget favors high-carry assets with an
+exact public spot listing, while half refreshes unseen or oldest markets. If every spot catalogue
+is unavailable, scanning falls back to carry and age priority instead of failing.
 
 Paper matching adds a conservative cost model (10 bps perp fill, each venue's base taker fee,
 5% annual financing, and a 7-day hold) and requires an exact same-asset OKX, Binance, Coinbase,
@@ -52,7 +55,8 @@ funding-arb-monitor serve
 
 Open http://127.0.0.1:8080 for the local dashboard. It shows scan status, candidates, trade
 recommendations, performance, and P&L/basis timelines for open and closed paper positions. FastAPI
-docs remain at http://127.0.0.1:8080/docs.
+docs remain at http://127.0.0.1:8080/docs. The summary distinguishes fresh and stale analyses,
+current ideas without an exact spot hedge, and progress toward the paper-validation evidence gate.
 
 Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/candidates`
 (add `?eligible_only=true` to filter or `?current_scan_only=true` for the actionable batch),

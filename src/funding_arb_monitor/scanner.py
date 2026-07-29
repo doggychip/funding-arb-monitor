@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from .analytics import (
     negative_hour_share_pct,
@@ -21,7 +22,7 @@ from .store import Store
 class ScanConfig:
     days: int = 30
     min_open_interest_usd: float = 1_000_000
-    max_history_fetches: int = 40
+    max_history_fetches: int = 80
     min_realized_7d_apr_pct: float = 15
     max_negative_hour_share_pct: float = 25
     min_day_volume_usd: float = 500_000
@@ -29,10 +30,17 @@ class ScanConfig:
 
 
 class Scanner:
-    def __init__(self, client: HyperliquidClient, store: Store, config: ScanConfig) -> None:
+    def __init__(
+        self,
+        client: HyperliquidClient,
+        store: Store,
+        config: ScanConfig,
+        hedgeable_assets_provider: Callable[[], set[str]] | None = None,
+    ) -> None:
         self.client = client
         self.store = store
         self.config = config
+        self.hedgeable_assets_provider = hedgeable_assets_provider
         self.costs = CostAssumptions()
 
     def select_history_candidates(self, snapshots: list[MarketSnapshot]) -> list[MarketSnapshot]:
@@ -47,8 +55,18 @@ class Scanner:
         priority_count = min(
             len(liquid), max(1, self.config.max_history_fetches // 2)
         )
+        hedgeable_assets: set[str] = set()
+        if self.hedgeable_assets_provider is not None:
+            try:
+                hedgeable_assets = self.hedgeable_assets_provider()
+            except RuntimeError as exc:
+                print(f"spot catalogue lookup failed: {exc}", file=sys.stderr)
         priority = sorted(
-            liquid, key=lambda item: abs(item.current_apr_pct), reverse=True
+            liquid,
+            key=lambda item: (
+                item.coin.split(":", 1)[-1] not in hedgeable_assets,
+                -abs(item.current_apr_pct),
+            ),
         )[:priority_count]
         priority_coins = {snapshot.coin for snapshot in priority}
         rotation = sorted(

@@ -140,3 +140,137 @@ def test_history_selection_keeps_a_current_leader_and_rotates_an_unseen_market(
         "HOT",
         "UNSEEN_A",
     ]
+
+
+def test_history_selection_prioritizes_a_hedgeable_leader(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    captured_at = datetime.now(timezone.utc)
+    snapshots = [
+        MarketSnapshot(
+            dex="(main)",
+            coin="UNHEDGEABLE",
+            funding_rate=0.002,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+        MarketSnapshot(
+            dex="(main)",
+            coin="HEDGEABLE",
+            funding_rate=0.001,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+    ]
+    scanner = Scanner(
+        FakeClient(),  # type: ignore[arg-type]
+        store,
+        ScanConfig(max_history_fetches=1),
+        hedgeable_assets_provider=lambda: {"HEDGEABLE"},
+    )
+
+    assert [item.coin for item in scanner.select_history_candidates(snapshots)] == [
+        "HEDGEABLE"
+    ]
+
+
+def test_history_selection_matches_namespaced_perp_to_exact_spot_asset(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    captured_at = datetime.now(timezone.utc)
+    snapshots = [
+        MarketSnapshot(
+            dex="(main)",
+            coin="UNHEDGEABLE",
+            funding_rate=0.002,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+        MarketSnapshot(
+            dex="xyz",
+            coin="xyz:HEDGEABLE",
+            funding_rate=0.001,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+    ]
+    scanner = Scanner(
+        FakeClient(),  # type: ignore[arg-type]
+        store,
+        ScanConfig(max_history_fetches=1),
+        hedgeable_assets_provider=lambda: {"HEDGEABLE"},
+    )
+
+    assert [item.coin for item in scanner.select_history_candidates(snapshots)] == [
+        "xyz:HEDGEABLE"
+    ]
+
+
+def test_history_selection_falls_back_when_spot_catalogues_fail(tmp_path) -> None:
+    def unavailable_catalogues() -> set[str]:
+        raise RuntimeError("spot venues unavailable")
+
+    captured_at = datetime.now(timezone.utc)
+    snapshots = [
+        MarketSnapshot(
+            dex="(main)",
+            coin="HOT",
+            funding_rate=0.002,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+        MarketSnapshot(
+            dex="(main)",
+            coin="COOL",
+            funding_rate=0.001,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        ),
+    ]
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    scanner = Scanner(
+        FakeClient(),  # type: ignore[arg-type]
+        store,
+        ScanConfig(max_history_fetches=1),
+        hedgeable_assets_provider=unavailable_catalogues,
+    )
+
+    assert [item.coin for item in scanner.select_history_candidates(snapshots)] == ["HOT"]
+
+
+def test_default_history_budget_refreshes_eighty_liquid_markets(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    captured_at = datetime.now(timezone.utc)
+    snapshots = [
+        MarketSnapshot(
+            dex="(main)",
+            coin=f"COIN_{index:03}",
+            funding_rate=index / 1_000_000,
+            open_interest_usd=2_000_000,
+            day_volume_usd=1_000_000,
+            mark_price=1,
+            captured_at=captured_at,
+        )
+        for index in range(100)
+    ]
+    scanner = Scanner(
+        FakeClient(),  # type: ignore[arg-type]
+        store,
+        ScanConfig(),
+    )
+
+    assert len(scanner.select_history_candidates(snapshots)) == 80

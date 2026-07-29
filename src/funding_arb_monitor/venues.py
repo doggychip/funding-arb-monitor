@@ -45,6 +45,8 @@ class HedgeQuote:
 class SpotVenue(Protocol):
     name: str
 
+    def assets(self) -> set[str]: ...
+
     def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None: ...
 
 
@@ -96,6 +98,21 @@ class CoinbaseSpot:
     def __init__(self, get_json: Callable[[str], object] | None = None) -> None:
         self.get_json = get_json or PublicJsonClient().get
         self._products: object | None = None
+
+    def assets(self) -> set[str]:
+        if self._products is None:
+            self._products = self.get_json(f"{self.base_url}/products")
+        products = self._products
+        if not isinstance(products, list):
+            return set()
+        return {
+            str(product["base_currency"])
+            for product in products
+            if isinstance(product, dict)
+            and product.get("quote_currency") in {"USD", "USDC"}
+            and product.get("status") == "online"
+            and not product.get("trading_disabled", False)
+        }
 
     def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None:
         if self._products is None:
@@ -154,6 +171,23 @@ class KrakenSpot:
     def __init__(self, get_json: Callable[[str], object] | None = None) -> None:
         self.get_json = get_json or PublicJsonClient().get
         self._pairs: object | None = None
+
+    def assets(self) -> set[str]:
+        if self._pairs is None:
+            self._pairs = self.get_json(f"{self.base_url}/AssetPairs")
+        payload = self._pairs
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        assets: set[str] = set()
+        for pair in result.values():
+            if not isinstance(pair, dict) or pair.get("status") != "online":
+                continue
+            wsname = str(pair.get("wsname") or "")
+            if "/" not in wsname:
+                continue
+            base, quote = wsname.split("/", 1)
+            if quote in {"USD", "USDC"}:
+                assets.add(base)
+        return assets
 
     def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None:
         if self._pairs is None:
@@ -216,6 +250,21 @@ class OkxSpot:
         self.get_json = get_json or PublicJsonClient().get
         self._instruments: object | None = None
 
+    def assets(self) -> set[str]:
+        if self._instruments is None:
+            self._instruments = self.get_json(
+                f"{self.base_url}/public/instruments?instType=SPOT"
+            )
+        payload = self._instruments
+        instruments = payload.get("data", []) if isinstance(payload, dict) else []
+        return {
+            str(instrument["baseCcy"])
+            for instrument in instruments
+            if isinstance(instrument, dict)
+            and instrument.get("quoteCcy") in {"USDC", "USDT"}
+            and instrument.get("state") == "live"
+        }
+
     def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None:
         if self._instruments is None:
             self._instruments = self.get_json(
@@ -277,6 +326,20 @@ class BinanceSpot:
         self.get_json = get_json or PublicJsonClient().get
         self._exchange_info: object | None = None
 
+    def assets(self) -> set[str]:
+        if self._exchange_info is None:
+            self._exchange_info = self.get_json(f"{self.base_url}/exchangeInfo")
+        payload = self._exchange_info
+        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
+        return {
+            str(symbol["baseAsset"])
+            for symbol in symbols
+            if isinstance(symbol, dict)
+            and symbol.get("quoteAsset") in {"USDC", "USDT"}
+            and symbol.get("status") == "TRADING"
+            and bool(symbol.get("isSpotTradingAllowed", True))
+        }
+
     def quote(self, asset: str, notional_usd: float) -> HedgeQuote | None:
         if self._exchange_info is None:
             self._exchange_info = self.get_json(f"{self.base_url}/exchangeInfo")
@@ -324,3 +387,18 @@ class BinanceSpot:
             fee_bps=self.fee_bps,
             captured_at_ms=int(time.time() * 1000),
         )
+
+
+def public_spot_assets(venues: list[SpotVenue] | None = None) -> set[str]:
+    venues = venues or [OkxSpot(), BinanceSpot(), CoinbaseSpot(), KrakenSpot()]
+    assets: set[str] = set()
+    available_catalogues = 0
+    for venue in venues:
+        try:
+            assets.update(venue.assets())
+            available_catalogues += 1
+        except RuntimeError:
+            continue
+    if available_catalogues == 0:
+        raise RuntimeError("all public spot catalogues unavailable")
+    return assets

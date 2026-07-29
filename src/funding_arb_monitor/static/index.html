@@ -87,6 +87,10 @@
       <div class="stat"><div class="value positive" id="eligible-count">—</div><div class="label">Current eligible markets</div></div>
       <div class="stat"><div class="value" id="best-carry">—</div><div class="label">Best 7d realized APR</div></div>
       <div class="stat"><div class="value" id="total-oi">—</div><div class="label">Candidate open interest</div></div>
+      <div class="stat"><div class="value" id="fresh-market-count">—</div><div class="label">Fresh analyses (&lt;6h)</div></div>
+      <div class="stat"><div class="value" id="stale-market-count">—</div><div class="label">Stale analyses (6h+)</div></div>
+      <div class="stat"><div class="value" id="no-hedge-count">—</div><div class="label">Current ideas without spot hedge</div></div>
+      <div class="stat"><div class="value" id="paper-progress">—</div><div class="label">Paper validation progress</div></div>
     </section>
 
     <section class="filters" aria-label="Candidate filters">
@@ -285,6 +289,10 @@
         document.querySelector("#eligible-count").textContent = eligible.length;
         document.querySelector("#best-carry").textContent = best ? percent(best.realized_7d_apr_pct) : "—";
         document.querySelector("#total-oi").textContent = money.format(candidates.reduce((sum, row) => sum + row.open_interest_usd, 0));
+        const freshCutoff = Date.now() - 6 * 60 * 60 * 1000;
+        const freshCount = candidates.filter((row) => new Date(row.analyzed_at).getTime() >= freshCutoff).length;
+        document.querySelector("#fresh-market-count").textContent = freshCount;
+        document.querySelector("#stale-market-count").textContent = candidates.length - freshCount;
         meta.textContent = analyzedAt
           ? `Latest scan: ${new Date(analyzedAt).toLocaleString()} · ${scanStatus?.candidate_count ?? currentCandidates.length} analyzed this run · ${candidates.length} markets tracked · run ${scanStatus?.status ?? "unknown"}`
           : "No persisted scan yet";
@@ -310,6 +318,9 @@
       const checks = checksResponse.ok ? await checksResponse.json() : [];
       const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
       const ideas = currentCandidates.filter((item) => item.eligible);
+      document.querySelector("#no-hedge-count").textContent = ideas.filter(
+        (item) => checksByCoin.get(item.coin)?.status === "no_exact_spot_market"
+      ).length;
 
       const proposedAction = (status, recommendation, check) => {
         if (recommendation) {
@@ -469,6 +480,8 @@
         ? "—"
         : `${performance.average_holding_hours.toFixed(1)}h`;
       const graduation = performance.graduation;
+      document.querySelector("#paper-progress").textContent =
+        `${graduation.closed_trades}/${graduation.required_closed_trades}`;
       document.querySelector("#performance-detail").textContent =
         `Open positions: ${performance.open_positions} · Open net P&L: ${money.format(performance.open_net_pnl_usd)} · Average hold: ${averageHold} · Live-review evidence: ${graduation.closed_trades}/${graduation.required_closed_trades} closed trades and ${graduation.observation_weeks.toFixed(1)}/${graduation.required_observation_weeks} weeks${reasons ? ` · Exits: ${reasons}` : ""}`;
     }

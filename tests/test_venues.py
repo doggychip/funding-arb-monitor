@@ -1,6 +1,12 @@
 import pytest
 
-from funding_arb_monitor.venues import BinanceSpot, CoinbaseSpot, KrakenSpot, OkxSpot
+from funding_arb_monitor.venues import (
+    BinanceSpot,
+    CoinbaseSpot,
+    KrakenSpot,
+    OkxSpot,
+    public_spot_assets,
+)
 
 
 def test_coinbase_exact_asset_quote_uses_depth() -> None:
@@ -100,3 +106,65 @@ def test_binance_exact_asset_quote_uses_depth() -> None:
     assert quote.venue == "binance"
     assert quote.symbol == "TESTUSDT"
     assert quote.fee_bps == 10
+
+
+def test_public_spot_assets_combines_exact_active_catalogues() -> None:
+    venues = [
+        CoinbaseSpot(
+            lambda _: [
+                {
+                    "id": "ALPHA-USD",
+                    "base_currency": "ALPHA",
+                    "quote_currency": "USD",
+                    "status": "online",
+                    "trading_disabled": False,
+                },
+                {
+                    "id": "DISABLED-USD",
+                    "base_currency": "DISABLED",
+                    "quote_currency": "USD",
+                    "status": "offline",
+                    "trading_disabled": False,
+                },
+            ]
+        ),
+        OkxSpot(
+            lambda _: {
+                "data": [
+                    {
+                        "instId": "BETA-USDC",
+                        "baseCcy": "BETA",
+                        "quoteCcy": "USDC",
+                        "state": "live",
+                    }
+                ]
+            }
+        ),
+    ]
+
+    assert public_spot_assets(venues) == {"ALPHA", "BETA"}
+
+
+def test_public_spot_assets_uses_available_catalogues_when_one_fails() -> None:
+    class UnavailableVenue:
+        name = "unavailable"
+
+        def assets(self) -> set[str]:
+            raise RuntimeError("temporary failure")
+
+    venues = [
+        UnavailableVenue(),
+        CoinbaseSpot(
+            lambda _: [
+                {
+                    "id": "ALPHA-USD",
+                    "base_currency": "ALPHA",
+                    "quote_currency": "USD",
+                    "status": "online",
+                    "trading_disabled": False,
+                }
+            ]
+        ),
+    ]
+
+    assert public_spot_assets(venues) == {"ALPHA"}
