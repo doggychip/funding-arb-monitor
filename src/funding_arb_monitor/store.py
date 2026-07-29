@@ -5,7 +5,7 @@ import os
 import shutil
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .costs import CostAssumptions
@@ -804,6 +804,182 @@ class Store:
             ).fetchall()
         return self._candidate_rows(rows)
 
+    def execution_ranked_candidates(self, limit: int = 100) -> list[dict[str, object]]:
+        latest_run = self.latest_successful_scan_run()
+        if latest_run is None:
+            return []
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.payload_json, c.scan_run_id,
+                    m.status AS execution_status,
+                    m.detail AS execution_detail,
+                    m.hedge_venue,
+                    m.hedge_symbol,
+                    m.net_apr_7d_pct AS executable_net_apr_pct,
+                    m.net_apr_14d_pct,
+                    m.net_apr_30d_pct
+                FROM candidates c
+                LEFT JOIN paper_match_checks m
+                    ON m.candidate_analyzed_at = c.analyzed_at
+                    AND m.coin = c.coin
+                WHERE c.scan_run_id = ?
+                    AND json_extract(c.payload_json, '$.eligible') = 1
+                ORDER BY m.net_apr_7d_pct IS NULL,
+                    m.net_apr_7d_pct DESC,
+                    json_extract(c.payload_json, '$.realized_7d_apr_pct') DESC
+                LIMIT ?
+                """,
+                (latest_run["id"], limit),
+            ).fetchall()
+        candidates = self._candidate_rows(rows)
+        for candidate, row in zip(candidates, rows):
+            candidate.update(
+                {
+                    "execution_status": row["execution_status"] or "not_checked",
+                    "execution_detail": row["execution_detail"],
+                    "hedge_venue": row["hedge_venue"],
+                    "hedge_symbol": row["hedge_symbol"],
+                    "executable_net_apr_pct": row["executable_net_apr_pct"],
+                    "net_apr_14d_pct": row["net_apr_14d_pct"],
+                    "net_apr_30d_pct": row["net_apr_30d_pct"],
+                }
+            )
+        return candidates
+
+    def execution_funnel(self) -> dict[str, object]:
+        latest_run = self.latest_successful_scan_run()
+        if latest_run is None:
+            return {
+                "scan_id": None,
+                "discovered": 0,
+                "analyzed": 0,
+                "monitoring_eligible": 0,
+                "spot_matched": 0,
+                "spot_depth_sufficient": 0,
+                "profitable_after_costs": 0,
+                "perp_executable": 0,
+                "paper_opened": 0,
+            }
+        ranked = self.execution_ranked_candidates(limit=500)
+        spot_matched = sum(
+            item["hedge_venue"] is not None
+            or item["execution_status"] == "spot_depth_below_5x_notional"
+            for item in ranked
+        )
+        spot_depth_sufficient = sum(
+            item["hedge_venue"] is not None for item in ranked
+        )
+        profitable_after_costs = sum(
+            item["executable_net_apr_pct"] is not None
+            and float(item["executable_net_apr_pct"]) >= 10
+            for item in ranked
+        )
+        perp_executable = sum(
+            item["execution_status"] == "pending_approval" for item in ranked
+        )
+        with self.connect() as connection:
+            paper_opened = connection.execute(
+                """
+                SELECT COUNT(DISTINCT p.id)
+                FROM paper_positions p
+                JOIN paper_recommendations r ON r.id = p.recommendation_id
+                JOIN candidates c
+                    ON c.analyzed_at = r.candidate_analyzed_at
+                    AND c.coin = r.coin
+                WHERE c.scan_run_id = ?
+                """,
+                (latest_run["id"],),
+            ).fetchone()[0]
+        return {
+            "scan_id": latest_run["id"],
+            "discovered": latest_run["snapshot_count"],
+            "analyzed": latest_run["candidate_count"],
+            "monitoring_eligible": latest_run["eligible_count"],
+            "spot_matched": spot_matched,
+            "spot_depth_sufficient": spot_depth_sufficient,
+            "profitable_after_costs": profitable_after_costs,
+            "perp_executable": perp_executable,
+            "paper_opened": paper_opened,
+        }
+
+    def rejection_analytics(self, days: int = 30) -> dict[str, object]:
+        cutoff_ms = int((time.time() - days * 86_400) * 1000)
+        cutoff_iso = datetime.fromtimestamp(
+            cutoff_ms / 1000, timezone.utc
+        ).isoformat()
+        with self.connect() as connection:
+            monitoring_rows = connection.execute(
+                """
+                SELECT reason.value AS reason, COUNT(*) AS count
+                FROM candidates c, json_each(c.payload_json, '$.reasons') reason
+                WHERE c.analyzed_at >= ?
+                GROUP BY reason.value
+                ORDER BY count DESC, reason.value
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+            execution_rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM paper_match_checks
+                WHERE checked_at_ms >= ?
+                    AND status NOT IN ('pending_approval', 'already_open')
+                GROUP BY status
+                ORDER BY count DESC, status
+                """,
+                (cutoff_ms,),
+            ).fetchall()
+            monitoring_daily = connection.execute(
+                """
+                SELECT substr(c.analyzed_at, 1, 10) AS day, COUNT(*) AS count
+                FROM candidates c, json_each(c.payload_json, '$.reasons') reason
+                WHERE c.analyzed_at >= ?
+                GROUP BY day
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+            execution_daily = connection.execute(
+                """
+                SELECT date(checked_at_ms / 1000, 'unixepoch') AS day,
+                    COUNT(*) AS count
+                FROM paper_match_checks
+                WHERE checked_at_ms >= ?
+                    AND status NOT IN ('pending_approval', 'already_open')
+                GROUP BY day
+                """,
+                (cutoff_ms,),
+            ).fetchall()
+        daily_by_date: dict[str, dict[str, object]] = {}
+        for row in monitoring_daily:
+            daily_by_date[str(row["day"])] = {
+                "date": str(row["day"]),
+                "monitoring_rejections": int(row["count"]),
+                "execution_checks": 0,
+            }
+        for row in execution_daily:
+            day = str(row["day"])
+            daily_by_date.setdefault(
+                day,
+                {
+                    "date": day,
+                    "monitoring_rejections": 0,
+                    "execution_checks": 0,
+                },
+            )["execution_checks"] = int(row["count"])
+        return {
+            "window_days": days,
+            "monitoring_reasons": {
+                str(row["reason"]): int(row["count"]) for row in monitoring_rows
+            },
+            "execution_statuses": {
+                str(row["status"]): int(row["count"]) for row in execution_rows
+            },
+            "daily": [
+                daily_by_date[day] for day in sorted(daily_by_date, reverse=True)
+            ],
+        }
+
     def _candidate_rows(
         self, rows: list[sqlite3.Row]
     ) -> list[dict[str, object]]:
@@ -1347,6 +1523,124 @@ class Store:
             "exit_reasons": exit_reasons,
             "graduation": graduation,
         }
+
+    def paper_strategy_analytics(self) -> dict[str, object]:
+        positions = {
+            int(item["id"]): item
+            for item in self.paper_positions()
+            if item["closed_at_ms"] is not None
+        }
+        if not positions:
+            return {
+                "total_closed_trades": 0,
+                "by_coin": [],
+                "by_venue": [],
+                "by_holding_period": [],
+                "by_entry_net_apr": [],
+                "by_market_regime": [],
+                "by_exit_reason": [],
+            }
+        placeholders = ", ".join("?" for _ in positions)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.id, r.gross_apr_pct, r.executable_net_apr_pct
+                FROM paper_positions p
+                LEFT JOIN paper_recommendations r ON r.id = p.recommendation_id
+                WHERE p.id IN ({placeholders})
+                """,
+                list(positions),
+            ).fetchall()
+        entry_by_position = {int(row["id"]): dict(row) for row in rows}
+        evidence: list[dict[str, object]] = []
+        for position_id, position in positions.items():
+            entry = entry_by_position.get(position_id, {})
+            holding_hours = (
+                int(position["closed_at_ms"]) - int(position["opened_at_ms"])
+            ) / 3_600_000
+            net_apr = entry.get("executable_net_apr_pct")
+            gross_apr = entry.get("gross_apr_pct")
+            evidence.append(
+                {
+                    **position,
+                    "holding_hours": holding_hours,
+                    "entry_net_apr_bucket": self._entry_net_apr_bucket(net_apr),
+                    "market_regime": self._market_regime(gross_apr),
+                    "holding_period": self._holding_period(holding_hours),
+                }
+            )
+
+        def summarize(field: str) -> list[dict[str, object]]:
+            groups: dict[str, list[dict[str, object]]] = {}
+            for item in evidence:
+                name = str(item.get(field) or "unknown")
+                groups.setdefault(name, []).append(item)
+            output: list[dict[str, object]] = []
+            for name, items in groups.items():
+                pnl = sum(float(item["net_pnl_usd"]) for item in items)
+                wins = sum(float(item["net_pnl_usd"]) > 0 for item in items)
+                output.append(
+                    {
+                        "name": name,
+                        "trades": len(items),
+                        "wins": wins,
+                        "win_rate_pct": wins / len(items) * 100,
+                        "net_pnl_usd": pnl,
+                        "average_net_pnl_usd": pnl / len(items),
+                        "average_holding_hours": sum(
+                            float(item["holding_hours"]) for item in items
+                        )
+                        / len(items),
+                    }
+                )
+            return sorted(
+                output,
+                key=lambda item: (-float(item["net_pnl_usd"]), str(item["name"])),
+            )
+
+        return {
+            "total_closed_trades": len(evidence),
+            "by_coin": summarize("coin"),
+            "by_venue": summarize("hedge_venue"),
+            "by_holding_period": summarize("holding_period"),
+            "by_entry_net_apr": summarize("entry_net_apr_bucket"),
+            "by_market_regime": summarize("market_regime"),
+            "by_exit_reason": summarize("exit_reason"),
+        }
+
+    @staticmethod
+    def _holding_period(hours: float) -> str:
+        if hours < 24:
+            return "under_24h"
+        if hours < 72:
+            return "1_to_3d"
+        if hours < 168:
+            return "3_to_7d"
+        return "7d_plus"
+
+    @staticmethod
+    def _entry_net_apr_bucket(value: object) -> str:
+        if value is None:
+            return "unknown"
+        apr = float(value)
+        if apr < 10:
+            return "under_10pct"
+        if apr < 25:
+            return "10_to_25pct"
+        if apr < 50:
+            return "25_to_50pct"
+        return "50pct_plus"
+
+    @staticmethod
+    def _market_regime(value: object) -> str:
+        if value is None:
+            return "unknown"
+        apr = float(value)
+        if apr < 30:
+            return "moderate_carry"
+        if apr < 60:
+            return "high_carry"
+        return "extreme_carry"
 
     @staticmethod
     def _paper_row(row: sqlite3.Row) -> dict[str, object]:

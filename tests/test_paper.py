@@ -107,6 +107,127 @@ def test_paper_performance_summarizes_closed_trades(tmp_path) -> None:
     }
 
 
+def test_paper_strategy_analytics_breaks_down_closed_trade_evidence(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    now_ms = int(time.time() * 1000)
+    recommendations = [
+        {
+            "created_at_ms": now_ms - 3 * 86_400_000,
+            "expires_at_ms": now_ms + 3_600_000,
+            "status": "approved",
+            "coin": "BTC",
+            "candidate_analyzed_at": "2026-07-26T00:00:00+00:00",
+            "venue": "binance",
+            "hedge_symbol": "BTCUSDC",
+            "side": "short_perp_long_hedge",
+            "notional_usd": 1_000,
+            "quantity": 1,
+            "perp_entry_price": 100,
+            "perp_bid_depth_usd": 20_000,
+            "perp_ask_depth_usd": 20_000,
+            "perp_spread_bps": 2,
+            "perp_quote_at_ms": now_ms,
+            "hedge_entry_price": 100,
+            "gross_apr_pct": 40,
+            "executable_net_apr_pct": 20,
+            "hedge_fee_bps": 10,
+            "hedge_spread_bps": 2,
+            "bid_depth_usd": 20_000,
+            "ask_depth_usd": 20_000,
+            "entry_cost_usd": 0,
+            "estimated_exit_cost_usd": 0,
+        },
+        {
+            "created_at_ms": now_ms - 2 * 86_400_000,
+            "expires_at_ms": now_ms + 3_600_000,
+            "status": "approved",
+            "coin": "ETH",
+            "candidate_analyzed_at": "2026-07-27T00:00:00+00:00",
+            "venue": "okx",
+            "hedge_symbol": "ETH-USDC",
+            "side": "short_perp_long_hedge",
+            "notional_usd": 1_000,
+            "quantity": 1,
+            "perp_entry_price": 100,
+            "perp_bid_depth_usd": 20_000,
+            "perp_ask_depth_usd": 20_000,
+            "perp_spread_bps": 2,
+            "perp_quote_at_ms": now_ms,
+            "hedge_entry_price": 100,
+            "gross_apr_pct": 80,
+            "executable_net_apr_pct": 50,
+            "hedge_fee_bps": 10,
+            "hedge_spread_bps": 2,
+            "bid_depth_usd": 20_000,
+            "ask_depth_usd": 20_000,
+            "entry_cost_usd": 0,
+            "estimated_exit_cost_usd": 0,
+        },
+    ]
+    recommendation_ids = [
+        store.save_paper_recommendation(item) for item in recommendations
+    ]
+    position_ids = [
+        store.open_paper_position(
+            coin=coin,
+            hedge_venue=venue,
+            side="short_perp_long_hedge",
+            notional_usd=1_000,
+            entry_cost_usd=0,
+            hedge_assessment="test",
+            notes="test",
+            recommendation_id=recommendation_id,
+        )
+        for coin, venue, recommendation_id in (
+            ("BTC", "binance", recommendation_ids[0]),
+            ("ETH", "okx", recommendation_ids[1]),
+        )
+    ]
+    store.save_paper_accruals(position_ids[0], [(now_ms, 10)])
+    store.save_paper_accruals(position_ids[1], [(now_ms, -5)])
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE paper_positions
+            SET opened_at_ms = ?, closed_at_ms = ?, exit_reason = ?, exit_cost_usd = 0
+            WHERE id = ?
+            """,
+            (now_ms - 12 * 3_600_000, now_ms, "funding_flipped_for_3_hours", position_ids[0]),
+        )
+        connection.execute(
+            """
+            UPDATE paper_positions
+            SET opened_at_ms = ?, closed_at_ms = ?, exit_reason = ?, exit_cost_usd = 0
+            WHERE id = ?
+            """,
+            (now_ms - 48 * 3_600_000, now_ms, "maximum_7d_holding_period", position_ids[1]),
+        )
+
+    analytics = store.paper_strategy_analytics()
+
+    assert analytics["total_closed_trades"] == 2
+    assert analytics["by_coin"][0]["name"] == "BTC"
+    assert analytics["by_coin"][0]["net_pnl_usd"] == pytest.approx(10, abs=0.1)
+    assert {item["name"] for item in analytics["by_venue"]} == {"binance", "okx"}
+    assert {item["name"] for item in analytics["by_holding_period"]} == {
+        "under_24h",
+        "1_to_3d",
+    }
+    assert {item["name"] for item in analytics["by_entry_net_apr"]} == {
+        "10_to_25pct",
+        "50pct_plus",
+    }
+    assert {item["name"] for item in analytics["by_market_regime"]} == {
+        "high_carry",
+        "extreme_carry",
+    }
+    assert {item["name"] for item in analytics["by_exit_reason"]} == {
+        "funding_flipped_for_3_hours",
+        "maximum_7d_holding_period",
+    }
+
+
 def test_paper_position_timeline_combines_funding_and_marks(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()

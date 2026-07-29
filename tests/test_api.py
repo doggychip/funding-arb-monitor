@@ -26,7 +26,11 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert 'id="stale-market-count"' in dashboard.text
     assert 'id="no-hedge-count"' in dashboard.text
     assert 'id="paper-progress"' in dashboard.text
+    assert 'id="funnel-steps"' in dashboard.text
+    assert 'id="rejection-rows"' in dashboard.text
+    assert 'id="strategy-rows"' in dashboard.text
     assert "monitoring eligible" in dashboard.text
+    assert "Skip; perp execution costs consume carry" in dashboard.text
     assert "Trade recommendations &amp; proposed actions" in dashboard.text
     assert "Monitor only; wait for an exact spot listing" in dashboard.text
     assert client.get("/api/candidates").json() == []
@@ -285,3 +289,175 @@ def test_dashboard_labels_candidate_analysis_age(tmp_path) -> None:
 
     assert dashboard.status_code == 200
     assert "Analysis age" in dashboard.text
+
+
+def test_execution_funnel_and_ranking_use_latest_match_checks(tmp_path) -> None:
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    analyzed_at = datetime.now(timezone.utc)
+    run_id = store.start_scan_run()
+    common = {
+        "dex": "(main)",
+        "side": "short_perp_long_hedge",
+        "history_hours": 168,
+        "open_interest_usd": 2_000_000,
+        "day_volume_usd": 1_000_000,
+        "current_apr_pct": 20.0,
+        "realized_apr_pct": 20.0,
+        "realized_24h_apr_pct": 20.0,
+        "estimated_net_7d_apr_pct": 10.0,
+        "hedge_assessment": "review",
+        "negative_hour_share_pct": 0.0,
+        "peak_decay_halflife_hours": None,
+    }
+    store.save_candidates(
+        [
+            Candidate(
+                coin="PROFIT",
+                realized_7d_apr_pct=40.0,
+                eligible=True,
+                reasons=(),
+                analyzed_at=analyzed_at,
+                **common,
+            ),
+            Candidate(
+                coin="LOSS",
+                realized_7d_apr_pct=35.0,
+                eligible=True,
+                reasons=(),
+                analyzed_at=analyzed_at,
+                **common,
+            ),
+            Candidate(
+                coin="REJECTED",
+                realized_7d_apr_pct=5.0,
+                eligible=False,
+                reasons=("7d_realized_apr_below_threshold",),
+                analyzed_at=analyzed_at,
+                **common,
+            ),
+        ],
+        scan_run_id=run_id,
+    )
+    store.finish_scan_run(
+        run_id,
+        status="success",
+        snapshot_count=10,
+        candidate_count=3,
+        eligible_count=2,
+    )
+    store.save_paper_match_check(
+        candidate_analyzed_at=analyzed_at.isoformat(),
+        coin="PROFIT",
+        status="pending_approval",
+        detail="executable",
+        hedge_venue="binance",
+        hedge_symbol="PROFITUSDC",
+        net_apr_7d_pct=20,
+    )
+    store.save_paper_match_check(
+        candidate_analyzed_at=analyzed_at.isoformat(),
+        coin="LOSS",
+        status="net_carry_below_threshold",
+        detail="not profitable",
+        hedge_venue="okx",
+        hedge_symbol="LOSS-USDC",
+        net_apr_7d_pct=-5,
+    )
+    client = TestClient(create_app(db_path))
+
+    funnel = client.get("/api/opportunities/funnel").json()
+    ranked = client.get("/api/opportunities/ranked").json()
+
+    assert funnel == {
+        "scan_id": run_id,
+        "discovered": 10,
+        "analyzed": 3,
+        "monitoring_eligible": 2,
+        "spot_matched": 2,
+        "spot_depth_sufficient": 2,
+        "profitable_after_costs": 1,
+        "perp_executable": 1,
+        "paper_opened": 0,
+    }
+    assert [item["coin"] for item in ranked] == ["PROFIT", "LOSS"]
+    assert ranked[0]["executable_net_apr_pct"] == 20
+    assert ranked[1]["executable_net_apr_pct"] == -5
+    assert ranked[1]["execution_status"] == "net_carry_below_threshold"
+
+
+def test_rejection_analytics_counts_monitoring_and_execution_history(tmp_path) -> None:
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    analyzed_at = datetime.now(timezone.utc)
+    common = {
+        "dex": "(main)",
+        "side": "short_perp_long_hedge",
+        "history_hours": 168,
+        "open_interest_usd": 2_000_000,
+        "day_volume_usd": 1_000_000,
+        "current_apr_pct": 5.0,
+        "realized_apr_pct": 5.0,
+        "realized_7d_apr_pct": 5.0,
+        "realized_24h_apr_pct": 5.0,
+        "estimated_net_7d_apr_pct": -10.0,
+        "hedge_assessment": "review",
+        "negative_hour_share_pct": 0.0,
+        "peak_decay_halflife_hours": None,
+        "eligible": False,
+        "analyzed_at": analyzed_at,
+    }
+    store.save_candidates(
+        [
+            Candidate(
+                coin="LOW",
+                reasons=("7d_realized_apr_below_threshold",),
+                **common,
+            ),
+            Candidate(
+                coin="THIN",
+                reasons=("day_volume_below_threshold",),
+                **common,
+            ),
+        ]
+    )
+    store.save_paper_match_check(
+        candidate_analyzed_at=analyzed_at.isoformat(),
+        coin="NOHEDGE",
+        status="no_exact_spot_market",
+        detail="no exact spot market",
+    )
+    store.save_paper_match_check(
+        candidate_analyzed_at=analyzed_at.isoformat(),
+        coin="TOOCOSTLY",
+        status="net_carry_below_threshold",
+        detail="costs exceed carry",
+        hedge_venue="binance",
+        hedge_symbol="TOOCOSTLYUSDC",
+        net_apr_7d_pct=-2,
+    )
+    store.save_paper_match_check(
+        candidate_analyzed_at=analyzed_at.isoformat(),
+        coin="PASSED",
+        status="pending_approval",
+        detail="execution checks passed",
+        hedge_venue="binance",
+        hedge_symbol="PASSEDUSDC",
+        net_apr_7d_pct=20,
+    )
+    client = TestClient(create_app(db_path))
+
+    analytics = client.get("/api/analytics/rejections?days=30").json()
+
+    assert analytics["monitoring_reasons"] == {
+        "7d_realized_apr_below_threshold": 1,
+        "day_volume_below_threshold": 1,
+    }
+    assert analytics["execution_statuses"] == {
+        "net_carry_below_threshold": 1,
+        "no_exact_spot_market": 1,
+    }
+    assert analytics["daily"][0]["monitoring_rejections"] == 2
+    assert analytics["daily"][0]["execution_checks"] == 2

@@ -57,6 +57,10 @@
     .badge.review { border-color: var(--amber); color: var(--amber); }
     #empty { color: var(--muted); display: none; padding: 28px 0 8px; }
     .notice { color: var(--muted); font-size: 12px; margin-top: 14px; }
+    .funnel { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .funnel-step { background: var(--surface-2); border-radius: 6px; padding: 12px; }
+    .funnel-step .value { font-size: 20px; font-weight: 650; }
+    .funnel-step .label { color: var(--muted); font-size: 12px; }
     .charts { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-top: 14px; }
     .chart { background: var(--surface-2); border-radius: 6px; padding: 10px; min-width: 0; }
     .chart h3 { color: var(--muted); font-size: 12px; font-weight: 550; margin: 0 0 6px; }
@@ -68,6 +72,7 @@
       .header { display: block; }
       .header button { margin-top: 16px; }
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .funnel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .charts { grid-template-columns: 1fr; }
     }
   </style>
@@ -91,6 +96,12 @@
       <div class="stat"><div class="value" id="stale-market-count">—</div><div class="label">Stale analyses (6h+)</div></div>
       <div class="stat"><div class="value" id="no-hedge-count">—</div><div class="label">Current ideas without spot hedge</div></div>
       <div class="stat"><div class="value" id="paper-progress">—</div><div class="label">Paper validation progress</div></div>
+    </section>
+
+    <section class="panel" style="margin-bottom: 18px">
+      <h2>Current execution funnel</h2>
+      <p class="subtle">The latest successful scan, narrowed from market discovery to simulation-ready execution.</p>
+      <div class="funnel" id="funnel-steps" style="margin-top: 12px"></div>
     </section>
 
     <section class="filters" aria-label="Candidate filters">
@@ -154,6 +165,34 @@
         <div class="stat"><div class="value negative" id="paper-drawdown">—</div><div class="label">Maximum drawdown</div></div>
       </div>
       <div id="performance-detail" class="notice"></div>
+    </section>
+    <section style="margin-top: 20px">
+      <h2>Strategy evidence</h2>
+      <p class="subtle">Closed paper results grouped by coin, venue, holding period, entry quality, carry regime, and exit reason.</p>
+      <div class="panel">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Dimension</th><th>Segment</th><th>Trades</th><th>Win rate</th><th>Net P&amp;L</th><th>Average hold</th></tr>
+            </thead>
+            <tbody id="strategy-rows"></tbody>
+          </table>
+        </div>
+        <div id="strategy-empty">No closed paper trades yet.</div>
+      </div>
+    </section>
+    <section style="margin-top: 20px">
+      <h2>Rejection history</h2>
+      <p class="subtle">Thirty-day monitoring and execution bottlenecks, ranked by frequency.</p>
+      <div class="panel">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th>Reason</th><th>Occurrences</th></tr></thead>
+            <tbody id="rejection-rows"></tbody>
+          </table>
+        </div>
+        <div id="rejection-empty">No rejection history in this window.</div>
+      </div>
     </section>
     <section style="margin-top: 20px">
       <h2>Paper positions</h2>
@@ -299,6 +338,7 @@
         render();
         await loadRecommendations();
         await loadPerformance();
+        await loadEvidence();
         await loadPaper();
       } catch (error) {
         meta.textContent = "Could not load candidates. Confirm the API is running.";
@@ -317,7 +357,10 @@
       const checksResponse = await apiFetch("/api/paper/match-checks");
       const checks = checksResponse.ok ? await checksResponse.json() : [];
       const checksByCoin = new Map(checks.map((item) => [item.coin, item]));
-      const ideas = currentCandidates.filter((item) => item.eligible);
+      const rankedResponse = await apiFetch("/api/opportunities/ranked?limit=500");
+      const ideas = rankedResponse.ok
+        ? await rankedResponse.json()
+        : currentCandidates.filter((item) => item.eligible);
       document.querySelector("#no-hedge-count").textContent = ideas.filter(
         (item) => checksByCoin.get(item.coin)?.status === "no_exact_spot_market"
       ).length;
@@ -336,6 +379,7 @@
           no_exact_spot_market: "Monitor only; wait for an exact spot listing",
           spot_depth_below_5x_notional: "Skip now; recheck depth next hour",
           net_carry_below_threshold: "Skip; carry does not clear costs",
+          perp_adjusted_net_carry_below_threshold: "Skip; perp execution costs consume carry",
           all_spot_venues_unavailable: "Retry automatically next hour",
           missing_perp_snapshot: "Wait for a fresh perp snapshot",
           stale_perp_snapshot: "Wait for the next successful scan",
@@ -368,6 +412,66 @@
         </tr>
       `}).join("");
       document.querySelector("#recommendation-empty").style.display = ideas.length ? "none" : "block";
+    }
+
+    async function loadEvidence() {
+      const [funnelResponse, rejectionResponse, strategyResponse] = await Promise.all([
+        apiFetch("/api/opportunities/funnel"),
+        apiFetch("/api/analytics/rejections?days=30"),
+        apiFetch("/api/paper/strategy-analytics")
+      ]);
+      if (funnelResponse.ok) {
+        const funnel = await funnelResponse.json();
+        const steps = [
+          ["Discovered", funnel.discovered],
+          ["Analyzed", funnel.analyzed],
+          ["Monitoring eligible", funnel.monitoring_eligible],
+          ["Exact spot found", funnel.spot_matched],
+          ["Spot depth sufficient", funnel.spot_depth_sufficient],
+          ["Profitable after costs", funnel.profitable_after_costs],
+          ["Perp executable", funnel.perp_executable],
+          ["Paper opened", funnel.paper_opened]
+        ];
+        document.querySelector("#funnel-steps").innerHTML = steps.map(([label, value]) => `
+          <div class="funnel-step"><div class="value">${value}</div><div class="label">${escapeHtml(label)}</div></div>
+        `).join("");
+      }
+      if (rejectionResponse.ok) {
+        const analytics = await rejectionResponse.json();
+        const rows = [
+          ...Object.entries(analytics.monitoring_reasons).map(([reason, count]) => ["Monitoring", reason, count]),
+          ...Object.entries(analytics.execution_statuses).map(([reason, count]) => ["Execution", reason, count])
+        ].sort((a, b) => b[2] - a[2]);
+        document.querySelector("#rejection-rows").innerHTML = rows.map(([stage, reason, count]) => `
+          <tr><td>${stage}</td><td>${escapeHtml(reason.replaceAll("_", " "))}</td><td>${count}</td></tr>
+        `).join("");
+        document.querySelector("#rejection-empty").style.display = rows.length ? "none" : "block";
+      }
+      if (strategyResponse.ok) {
+        const analytics = await strategyResponse.json();
+        const dimensions = [
+          ["Coin", analytics.by_coin],
+          ["Venue", analytics.by_venue],
+          ["Holding period", analytics.by_holding_period],
+          ["Entry net APR", analytics.by_entry_net_apr],
+          ["Carry regime", analytics.by_market_regime],
+          ["Exit reason", analytics.by_exit_reason]
+        ];
+        const rows = dimensions.flatMap(([dimension, groups]) =>
+          groups.map((group) => [dimension, group])
+        );
+        document.querySelector("#strategy-rows").innerHTML = rows.map(([dimension, group]) => `
+          <tr>
+            <td>${escapeHtml(dimension)}</td>
+            <td>${escapeHtml(group.name.replaceAll("_", " "))}</td>
+            <td>${group.trades}</td>
+            <td>${group.win_rate_pct.toFixed(1)}%</td>
+            <td class="${numberClass(group.net_pnl_usd)}">${money.format(group.net_pnl_usd)}</td>
+            <td>${group.average_holding_hours.toFixed(1)}h</td>
+          </tr>
+        `).join("");
+        document.querySelector("#strategy-empty").style.display = rows.length ? "none" : "block";
+      }
     }
 
     async function loadPaper() {

@@ -127,6 +127,22 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> list[dict[str, object]]:
         return store.actionable_candidates(limit)
 
+    @app.get("/api/opportunities/ranked")
+    def ranked_opportunities(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, object]]:
+        return store.execution_ranked_candidates(limit)
+
+    @app.get("/api/opportunities/funnel")
+    def opportunity_funnel() -> dict[str, object]:
+        return store.execution_funnel()
+
+    @app.get("/api/analytics/rejections")
+    def rejection_analytics(
+        days: int = Query(default=30, ge=1, le=365),
+    ) -> dict[str, object]:
+        return store.rejection_analytics(days)
+
     @app.get("/api/status")
     def status() -> dict[str, object]:
         result = store.latest_scan_run() or {"status": "never_run"}
@@ -181,6 +197,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     @app.get("/api/paper/performance")
     def paper_performance() -> dict[str, object]:
         return store.paper_performance()
+
+    @app.get("/api/paper/strategy-analytics")
+    def paper_strategy_analytics() -> dict[str, object]:
+        return store.paper_strategy_analytics()
 
     @app.get("/api/alerts/deliveries")
     def alert_deliveries(

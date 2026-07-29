@@ -61,9 +61,12 @@ current ideas without an exact spot hedge, and progress toward the paper-validat
 Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/candidates`
 (add `?eligible_only=true` to filter or `?current_scan_only=true` for the actionable batch),
 `GET /api/opportunities/actionable`,
+`GET /api/opportunities/ranked`, `GET /api/opportunities/funnel`,
+`GET /api/analytics/rejections`,
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
 `GET /api/paper/positions/{id}/timeline`, `GET /api/paper/report`,
-`GET /api/paper/performance`, `GET /api/alerts/deliveries`, and
+`GET /api/paper/performance`, `GET /api/paper/strategy-analytics`,
+`GET /api/alerts/deliveries`, and
 `POST /api/paper/recommendations/{id}/approve`.
 
 The candidate API and dashboard retain the newest analysis for every market observed across
@@ -73,6 +76,12 @@ Every candidate includes `scan_id`, `analysis_age_seconds`, and `actionable_now`
 `/api/opportunities/actionable` is the machine-consumption endpoint: it returns only eligible rows
 attached to the latest successful scan. Historical eligibility must never be treated as an order
 signal.
+
+The execution funnel connects the latest successful scan to exact spot matching, depth, costs,
+perp execution, and paper entry. Ranked opportunities use executable net APR when a match check is
+available, including public two-sided perp slippage. Thirty-day rejection analytics expose both
+monitoring gates and execution outcomes. Strategy analytics group closed paper results by coin,
+venue, holding period, entry net APR, gross-carry regime, and exit reason.
 
 ## Paper positions
 

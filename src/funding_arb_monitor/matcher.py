@@ -100,6 +100,23 @@ class PaperMatcher:
                     gross_apr=gross_apr,
                 )
                 continue
+            executable_net_apr = self._net_apr(
+                gross_apr, quote, perp_quote=perp_quote
+            )
+            if executable_net_apr < self.min_net_apr_pct:
+                self._record_check(
+                    analyzed_at,
+                    coin,
+                    "perp_adjusted_net_carry_below_threshold",
+                    (
+                        f"perp-adjusted executable net APR {executable_net_apr:.1f}% "
+                        f"< {self.min_net_apr_pct:.1f}%"
+                    ),
+                    quote=quote,
+                    gross_apr=gross_apr,
+                    perp_quote=perp_quote,
+                )
+                continue
             now_ms = int(time.time() * 1000)
             recommendation = {
                 "created_at_ms": now_ms,
@@ -121,6 +138,7 @@ class PaperMatcher:
                 f"{quote.venue} {quote.symbol}; executable net APR {net_apr:.1f}%",
                 quote=quote,
                 gross_apr=gross_apr,
+                perp_quote=perp_quote,
             )
         return created
 
@@ -201,6 +219,14 @@ class PaperMatcher:
             > self.max_snapshot_age_seconds * 1000
         ):
             raise ValueError("perp quote is stale")
+        executable_net_apr = self._net_apr(
+            gross_apr, quote, perp_quote=perp_quote
+        )
+        if executable_net_apr < self.min_net_apr_pct:
+            raise ValueError(
+                "perp-adjusted executable net APR is now "
+                f"{executable_net_apr:.1f}% < {self.min_net_apr_pct:.1f}%"
+            )
         execution = self._execution(gross_apr, quote, perp_quote)
         position_id = self.store.approve_paper_recommendation(
             recommendation_id,
@@ -214,10 +240,21 @@ class PaperMatcher:
         return position
 
     def _net_apr(
-        self, gross_apr: float, quote: HedgeQuote, holding_days: int | None = None
+        self,
+        gross_apr: float,
+        quote: HedgeQuote,
+        holding_days: int | None = None,
+        perp_quote: PerpQuote | None = None,
     ) -> float:
         total_round_trip_bps = (
-            self.perp_fee_bps * 2 + quote.entry_cost_bps + quote.exit_cost_bps
+            (
+                self._perp_entry_cost_bps(perp_quote)
+                + self._perp_exit_cost_bps(perp_quote)
+                if perp_quote is not None
+                else self.perp_fee_bps * 2
+            )
+            + quote.entry_cost_bps
+            + quote.exit_cost_bps
         )
         annualized_cost_pct = (
             total_round_trip_bps
@@ -244,18 +281,34 @@ class PaperMatcher:
             "perp_quote_at_ms": perp_quote.captured_at_ms,
             "hedge_entry_price": quote.executable_buy_price,
             "gross_apr_pct": gross_apr,
-            "executable_net_apr_pct": self._net_apr(gross_apr, quote),
+            "executable_net_apr_pct": self._net_apr(
+                gross_apr, quote, perp_quote=perp_quote
+            ),
             "hedge_fee_bps": quote.fee_bps,
             "hedge_spread_bps": quote.spread_bps,
             "bid_depth_usd": quote.bid_depth_usd,
             "ask_depth_usd": quote.ask_depth_usd,
             "entry_cost_usd": self.notional_usd
-            * (self.perp_fee_bps + quote.entry_cost_bps)
+            * (self._perp_entry_cost_bps(perp_quote) + quote.entry_cost_bps)
             / 10_000,
             "estimated_exit_cost_usd": self.notional_usd
-            * (self.perp_fee_bps + quote.exit_cost_bps)
+            * (self._perp_exit_cost_bps(perp_quote) + quote.exit_cost_bps)
             / 10_000,
         }
+
+    def _perp_entry_cost_bps(self, quote: PerpQuote) -> float:
+        midpoint = (quote.bid + quote.ask) / 2
+        slippage_bps = (
+            (midpoint - quote.executable_sell_price) / midpoint * 10_000
+        )
+        return self.perp_fee_bps + max(slippage_bps, quote.spread_bps / 2)
+
+    def _perp_exit_cost_bps(self, quote: PerpQuote) -> float:
+        midpoint = (quote.bid + quote.ask) / 2
+        slippage_bps = (
+            (quote.executable_buy_price - midpoint) / midpoint * 10_000
+        )
+        return self.perp_fee_bps + max(slippage_bps, quote.spread_bps / 2)
 
     def _best_quote(self, asset: str) -> tuple[HedgeQuote | None, str]:
         quotes: list[HedgeQuote] = []
@@ -295,6 +348,7 @@ class PaperMatcher:
         *,
         quote: HedgeQuote | None = None,
         gross_apr: float | None = None,
+        perp_quote: PerpQuote | None = None,
     ) -> None:
         self.store.save_paper_match_check(
             candidate_analyzed_at=analyzed_at,
@@ -304,17 +358,17 @@ class PaperMatcher:
             hedge_venue=quote.venue if quote else None,
             hedge_symbol=quote.symbol if quote else None,
             net_apr_7d_pct=(
-                self._net_apr(gross_apr, quote, 7)
+                self._net_apr(gross_apr, quote, 7, perp_quote)
                 if quote is not None and gross_apr is not None
                 else None
             ),
             net_apr_14d_pct=(
-                self._net_apr(gross_apr, quote, 14)
+                self._net_apr(gross_apr, quote, 14, perp_quote)
                 if quote is not None and gross_apr is not None
                 else None
             ),
             net_apr_30d_pct=(
-                self._net_apr(gross_apr, quote, 30)
+                self._net_apr(gross_apr, quote, 30, perp_quote)
                 if quote is not None and gross_apr is not None
                 else None
             ),

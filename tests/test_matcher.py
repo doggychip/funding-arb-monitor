@@ -68,6 +68,23 @@ class FakePerpClient:
         )
 
 
+class WideSpreadPerpClient(FakePerpClient):
+    def perp_quote(
+        self, coin: str, dex: str, notional_usd: float
+    ) -> PerpQuote | None:
+        return PerpQuote(
+            coin=coin,
+            dex=dex,
+            bid=80,
+            ask=120,
+            executable_sell_price=80,
+            executable_buy_price=120,
+            bid_depth_usd=20_000,
+            ask_depth_usd=20_000,
+            captured_at_ms=int(time.time() * 1000),
+        )
+
+
 def seed_candidate(store: Store) -> None:
     now = datetime.now(timezone.utc)
     store.save_snapshots(
@@ -111,16 +128,16 @@ def test_matcher_requires_approval_before_opening_position(tmp_path) -> None:
     recommendations = matcher.recommend()
 
     assert len(recommendations) == 1
-    assert recommendations[0]["executable_net_apr_pct"] == pytest.approx(163.7142857)
+    assert recommendations[0]["executable_net_apr_pct"] == pytest.approx(64.3945578)
     assert recommendations[0]["perp_entry_price"] == 104
     assert recommendations[0]["perp_bid_depth_usd"] == 20_000
     assert recommendations[0]["perp_ask_depth_usd"] == 20_000
     assert recommendations[0]["perp_quote_at_ms"] > 0
     check = store.latest_paper_match_checks()[0]
     assert check["hedge_venue"] == "coinbase"
-    assert check["net_apr_7d_pct"] == pytest.approx(163.7142857)
-    assert check["net_apr_14d_pct"] == pytest.approx(179.3571429)
-    assert check["net_apr_30d_pct"] == pytest.approx(187.7)
+    assert check["net_apr_7d_pct"] == pytest.approx(64.3945578)
+    assert check["net_apr_14d_pct"] == pytest.approx(129.6972789)
+    assert check["net_apr_30d_pct"] == pytest.approx(164.5253968)
     assert store.open_paper_positions() == []
     recommendation_id = recommendations[0]["id"]
 
@@ -141,6 +158,22 @@ def test_matcher_requires_approval_before_opening_position(tmp_path) -> None:
     with pytest.raises(ValueError, match="approved"):
         matcher.approve(recommendation_id)
     assert len(store.open_paper_positions()) == 1
+
+
+def test_matcher_rejects_carry_consumed_by_executable_perp_slippage(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    seed_candidate(store)
+    matcher = PaperMatcher(
+        store,
+        venues=[FakeVenue()],  # type: ignore[list-item]
+        perp_client=WideSpreadPerpClient(),  # type: ignore[arg-type]
+    )
+
+    assert matcher.recommend() == []
+    check = store.latest_paper_match_checks()[0]
+    assert check["status"] == "perp_adjusted_net_carry_below_threshold"
+    assert check["net_apr_7d_pct"] < 10
 
 
 def test_approval_rejects_deteriorated_spot_depth(tmp_path) -> None:
