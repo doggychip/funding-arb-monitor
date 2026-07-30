@@ -105,8 +105,8 @@
     </section>
 
     <section style="margin-bottom: 18px">
-      <h2>Cross-perpetual monitoring evidence</h2>
-      <p class="subtle" id="cross-perp-status">Loading public cross-perpetual evidence…</p>
+      <h2 id="cross-perp-heading">Cross-perpetual monitoring evidence</h2>
+      <p class="subtle" id="cross-perp-status" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">Loading public cross-perpetual evidence…</p>
       <div class="stats" id="cross-perp-counters" style="margin-top: 10px">
         <div class="stat"><div class="value" id="cross-perp-evaluated">—</div><div class="label">Routes evaluated</div></div>
         <div class="stat"><div class="value positive" id="cross-perp-positive">—</div><div class="label">Positive after costs</div></div>
@@ -115,17 +115,17 @@
       </div>
       <div class="panel">
         <div class="table-wrap">
-          <table>
+          <table aria-labelledby="cross-perp-heading">
             <thead>
               <tr>
-                <th>Asset</th><th>Route</th><th>Direction</th><th>Gross 7d APR</th><th>Net 7d APR</th>
-                <th>Basis</th><th>Executable depth</th><th>Streak</th><th>Status / reasons</th><th>Data age</th>
+                <th scope="col">Asset</th><th scope="col">Route</th><th scope="col">Direction</th><th scope="col">Gross 7d APR</th><th scope="col">Net 7d APR</th>
+                <th scope="col">Basis</th><th scope="col">Executable depth</th><th scope="col">Streak</th><th scope="col">Status / reasons</th><th scope="col">Data age</th>
               </tr>
             </thead>
             <tbody id="cross-perp-rows"></tbody>
           </table>
         </div>
-        <div id="cross-perp-empty">No completed cross-perpetual observation yet. Run <code>funding-arb-monitor cross-perp</code>, then refresh this page.</div>
+        <div id="cross-perp-empty" hidden>No completed cross-perpetual observation yet. Run <code>funding-arb-monitor cross-perp</code>, then refresh this page.</div>
       </div>
     </section>
 
@@ -294,16 +294,32 @@
     const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     })[char]);
+    let readTokenPromptPromise = null;
+    async function promptForReadToken() {
+      if (!readTokenPromptPromise) {
+        readTokenPromptPromise = Promise.resolve(prompt("Enter the read-access token"));
+      }
+      const currentPrompt = readTokenPromptPromise;
+      try {
+        return await currentPrompt;
+      } finally {
+        if (readTokenPromptPromise === currentPrompt) readTokenPromptPromise = null;
+      }
+    }
     async function apiFetch(url) {
-      let readToken = sessionStorage.getItem("funding-arb-read-token");
+      const tokenKey = "funding-arb-read-token";
+      let readToken = sessionStorage.getItem(tokenKey);
       let response = await fetch(url, {
         headers: readToken ? { "X-Read-Token": readToken } : {}
       });
       if (response.status !== 401) return response;
-      sessionStorage.removeItem("funding-arb-read-token");
-      readToken = prompt("Enter the read-access token");
+      if (readToken && sessionStorage.getItem(tokenKey) === readToken) {
+        sessionStorage.removeItem(tokenKey);
+      }
+      readToken = sessionStorage.getItem(tokenKey);
+      if (!readToken) readToken = await promptForReadToken();
       if (!readToken) return response;
-      sessionStorage.setItem("funding-arb-read-token", readToken);
+      sessionStorage.setItem(tokenKey, readToken);
       return fetch(url, { headers: { "X-Read-Token": readToken } });
     }
 
@@ -379,6 +395,7 @@
       const empty = document.querySelector("#cross-perp-empty");
       const emptyMessage = "No completed cross-perpetual observation yet. Run funding-arb-monitor cross-perp, then refresh this page.";
       status.textContent = "Loading public cross-perpetual evidence…";
+      status.setAttribute("aria-busy", "true");
       try {
         const [summaryResponse, opportunitiesResponse] = await Promise.all([
           apiFetch("/api/cross-perp/summary"),
@@ -431,16 +448,18 @@
           `;
         }).join("");
         empty.textContent = emptyMessage;
-        empty.style.display = opportunities.length ? "none" : "block";
+        empty.hidden = opportunities.length > 0;
+        status.setAttribute("aria-busy", "false");
       } catch (error) {
         status.textContent = "Cross-perpetual evidence is unavailable; spot-perpetual monitoring remains available.";
+        status.setAttribute("aria-busy", "false");
         document.querySelector("#cross-perp-evaluated").textContent = "—";
         document.querySelector("#cross-perp-positive").textContent = "—";
         document.querySelector("#cross-perp-ready").textContent = "—";
         document.querySelector("#cross-perp-coverage").textContent = "—";
         document.querySelector("#cross-perp-rows").innerHTML = "";
         empty.textContent = "Could not load cross-perpetual evidence. Refresh to retry.";
-        empty.style.display = "block";
+        empty.hidden = false;
       }
     }
 

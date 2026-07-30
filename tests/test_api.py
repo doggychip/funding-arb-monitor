@@ -282,6 +282,25 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert client.get("/api/alerts/deliveries").json() == []
 
 
+def test_cross_perp_dashboard_accessibility_and_shared_token_prompt(tmp_path) -> None:
+    client = TestClient(create_app(str(tmp_path / "test.db")))
+
+    dashboard = client.get("/")
+
+    assert dashboard.status_code == 200
+    assert 'id="cross-perp-heading"' in dashboard.text
+    assert 'role="status"' in dashboard.text
+    assert 'aria-live="polite"' in dashboard.text
+    assert 'aria-atomic="true"' in dashboard.text
+    assert 'aria-busy="true"' in dashboard.text
+    assert 'aria-labelledby="cross-perp-heading"' in dashboard.text
+    assert dashboard.text.count('<th scope="col">') >= 10
+    assert 'id="cross-perp-empty" hidden' in dashboard.text
+    assert "let readTokenPromptPromise = null;" in dashboard.text
+    assert "if (!readTokenPromptPromise)" in dashboard.text
+    assert "await promptForReadToken()" in dashboard.text
+
+
 def test_approval_token_protects_public_mutation(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FUNDING_ARB_APPROVAL_TOKEN", "secret")
     client = TestClient(create_app(str(tmp_path / "test.db")))
