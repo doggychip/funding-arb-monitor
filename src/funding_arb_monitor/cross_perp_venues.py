@@ -63,27 +63,28 @@ class ExternalPerpVenue(Protocol):
 def _book_vwap(levels: object, notional_usd: float) -> tuple[float | None, float]:
     if not isinstance(levels, list) or not levels:
         raise RuntimeError("invalid perpetual order book response")
-    remaining = notional_usd
-    filled_quantity = 0.0
-    filled_notional = 0.0
-    total_depth = 0.0
     try:
+        parsed_levels: list[tuple[float, float]] = []
         for level in levels:
             if not isinstance(level, list):
                 raise TypeError
             price, quantity = float(level[0]), float(level[1])
             if price <= 0 or quantity < 0:
                 raise ValueError
-            level_notional = price * quantity
-            total_depth += level_notional
-            take_notional = min(remaining, level_notional)
-            filled_notional += take_notional
-            filled_quantity += take_notional / price
-            remaining -= take_notional
-            if remaining <= 1e-9:
-                break
+            parsed_levels.append((price, quantity))
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError("invalid perpetual order book response") from exc
+    total_depth = sum(price * quantity for price, quantity in parsed_levels)
+    remaining = notional_usd
+    filled_quantity = 0.0
+    filled_notional = 0.0
+    for price, quantity in parsed_levels:
+        take_notional = min(remaining, price * quantity)
+        filled_notional += take_notional
+        filled_quantity += take_notional / price
+        remaining -= take_notional
+        if remaining <= 1e-9:
+            break
     if remaining > 1e-9 or filled_quantity == 0:
         return None, total_depth
     return filled_notional / filled_quantity, total_depth
@@ -137,19 +138,27 @@ class BinancePerpVenue:
         if self._exchange_info is None:
             self._exchange_info = self.get_json(f"{self.base_url}/fapi/v1/exchangeInfo")
         payload = self._exchange_info
-        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
-        return {
-            str(symbol["baseAsset"]): PerpInstrument(
-                venue=self.name,
-                asset=str(symbol["baseAsset"]),
-                symbol=str(symbol["symbol"]),
-            )
-            for symbol in symbols
-            if isinstance(symbol, dict)
-            and symbol.get("contractType") == "PERPETUAL"
-            and symbol.get("status") == "TRADING"
-            and symbol.get("quoteAsset") == "USDT"
-        }
+        try:
+            if not isinstance(payload, dict) or not isinstance(payload["symbols"], list):
+                raise TypeError
+            instruments: dict[str, PerpInstrument] = {}
+            for symbol in payload["symbols"]:
+                if not isinstance(symbol, dict):
+                    raise TypeError
+                if (
+                    symbol.get("contractType") != "PERPETUAL"
+                    or symbol.get("status") != "TRADING"
+                    or symbol.get("quoteAsset") != "USDT"
+                ):
+                    continue
+                asset = str(symbol["baseAsset"])
+                market_symbol = str(symbol["symbol"])
+                if not asset or not market_symbol:
+                    raise ValueError
+                instruments[asset] = PerpInstrument(self.name, asset, market_symbol)
+            return instruments
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid Binance perpetual instrument response") from exc
 
     def market(
         self, instrument: PerpInstrument, *, days: int, notional_usd: float
@@ -207,31 +216,35 @@ class OkxPerpVenue:
                 f"{self.base_url}/public/instruments?instType=SWAP"
             )
         payload = self._instruments
-        instruments = payload.get("data", []) if isinstance(payload, dict) else []
-        matches = [
-            instrument
-            for instrument in instruments
-            if isinstance(instrument, dict)
-            and instrument.get("ctType") == "linear"
-            and instrument.get("state") == "live"
-            and instrument.get("settleCcy") in {"USDT", "USDC"}
-        ]
-        selected: dict[str, dict[str, object]] = {}
-        for instrument in matches:
-            underlying = str(instrument.get("uly") or "")
-            asset = underlying.split("-", 1)[0]
-            if not asset:
-                continue
-            existing = selected.get(asset)
-            if existing is None or (
-                instrument.get("settleCcy") == "USDT"
-                and existing.get("settleCcy") != "USDT"
-            ):
-                selected[asset] = instrument
-        return {
-            asset: PerpInstrument(self.name, asset, str(instrument["instId"]))
-            for asset, instrument in selected.items()
-        }
+        try:
+            if not isinstance(payload, dict) or not isinstance(payload["data"], list):
+                raise TypeError
+            selected: dict[str, tuple[str, str]] = {}
+            for instrument in payload["data"]:
+                if not isinstance(instrument, dict):
+                    raise TypeError
+                if (
+                    instrument.get("ctType") != "linear"
+                    or instrument.get("state") != "live"
+                    or instrument.get("settleCcy") not in {"USDT", "USDC"}
+                ):
+                    continue
+                underlying = str(instrument["uly"])
+                asset = underlying.split("-", 1)[0]
+                market_symbol = str(instrument["instId"])
+                if not asset or "-" not in underlying or not market_symbol:
+                    raise ValueError
+                existing = selected.get(asset)
+                if existing is None or (
+                    instrument["settleCcy"] == "USDT" and existing[0] != "USDT"
+                ):
+                    selected[asset] = (str(instrument["settleCcy"]), market_symbol)
+            return {
+                asset: PerpInstrument(self.name, asset, market_symbol)
+                for asset, (_, market_symbol) in selected.items()
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid OKX perpetual instrument response") from exc
 
     def market(
         self, instrument: PerpInstrument, *, days: int, notional_usd: float

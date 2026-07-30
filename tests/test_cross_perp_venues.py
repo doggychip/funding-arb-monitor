@@ -1,6 +1,8 @@
 import time
 import urllib.parse
 
+import pytest
+
 from funding_arb_monitor.cross_perp_venues import (
     BinancePerpVenue,
     OkxPerpVenue,
@@ -86,6 +88,8 @@ def test_binance_market_uses_funding_history_and_executable_depth() -> None:
     assert [point.funding_rate for point in market.funding_events] == [0.0001, -0.0002]
     assert market.quote.executable_buy_price == 2.01
     assert market.quote.executable_sell_price == 1.99
+    assert market.quote.bid_depth_usd == pytest.approx(1_392.0)
+    assert market.quote.ask_depth_usd == pytest.approx(1_408.0)
     assert market.quote.fee_bps == 5.0
 
 
@@ -147,3 +151,76 @@ def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
         str(second_timestamp),
         str(third_timestamp),
     ]
+
+
+def test_market_preserves_visible_depth_when_execution_is_insufficient() -> None:
+    responses = {
+        "/fapi/v1/premiumIndex": {
+            "markPrice": "2.00",
+            "lastFundingRate": "0.0001",
+            "time": 1_000_000,
+        },
+        "/fapi/v1/fundingRate": [],
+        "/fapi/v1/depth": {
+            "T": 1_000_000,
+            "bids": [["1.99", "100"]],
+            "asks": [["2.01", "100"]],
+        },
+    }
+    venue = BinancePerpVenue(
+        get_json=lambda url: responses[urllib.parse.urlsplit(url).path]
+    )
+
+    market = venue.market(
+        PerpInstrument("binance", "ZRO", "ZROUSDT"), days=7, notional_usd=1_000
+    )
+
+    assert market.quote.executable_buy_price is None
+    assert market.quote.executable_sell_price is None
+    assert market.quote.bid_depth_usd == pytest.approx(199.0)
+    assert market.quote.ask_depth_usd == pytest.approx(201.0)
+
+
+@pytest.mark.parametrize(
+    "venue",
+    [
+        BinancePerpVenue(get_json=lambda _: []),
+        OkxPerpVenue(get_json=lambda _: {"data": {}}),
+    ],
+)
+def test_discovery_rejects_malformed_top_level_payloads(venue) -> None:
+    with pytest.raises(RuntimeError, match="instrument response"):
+        venue.instruments()
+
+
+@pytest.mark.parametrize(
+    "venue",
+    [
+        BinancePerpVenue(
+            get_json=lambda _: {
+                "symbols": [
+                    {
+                        "symbol": "ZROUSDT",
+                        "quoteAsset": "USDT",
+                        "contractType": "PERPETUAL",
+                        "status": "TRADING",
+                    }
+                ]
+            }
+        ),
+        OkxPerpVenue(
+            get_json=lambda _: {
+                "data": [
+                    {
+                        "ctType": "linear",
+                        "state": "live",
+                        "settleCcy": "USDT",
+                    }
+                ]
+            }
+        ),
+    ],
+)
+def test_discovery_rejects_malformed_matching_records(venue) -> None:
+    with pytest.raises(RuntimeError, match="instrument response"):
+        venue.instruments()
