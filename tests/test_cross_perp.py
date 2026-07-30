@@ -643,6 +643,50 @@ def test_monitor_fails_when_all_external_catalogues_fail_without_copying_stale_r
     assert store.latest_cross_perp_observations() == []
 
 
+def test_monitor_fails_when_hyperliquid_funding_history_is_unavailable(tmp_path) -> None:
+    class HistoryFailureHyperliquid(FakeHyperliquid):
+        def funding_history(self, coin: str, days: int):
+            raise RuntimeError("funding history unavailable")
+
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(store, [qualifying_observation(observed_at_ms=NOW_MS - 1)])
+
+    with pytest.raises(RuntimeError, match="Hyperliquid market data unavailable"):
+        CrossPerpMonitor(
+            hyperliquid=HistoryFailureHyperliquid(),
+            venues=[FakeExternalVenue("binance", ("ZRO",))],
+            store=store,
+            now_ms=lambda: NOW_MS,
+        ).run()
+
+    assert store.cross_perp_summary()["status"] == "failed"
+    assert store.latest_cross_perp_observations() == []
+
+
+def test_monitor_fails_when_hyperliquid_order_book_is_unavailable(tmp_path) -> None:
+    class BookFailureHyperliquid(FakeHyperliquid):
+        def perp_quote(
+            self, coin: str, dex: str, notional_usd: float
+        ) -> PerpQuote:
+            raise RuntimeError("order book unavailable")
+
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(store, [qualifying_observation(observed_at_ms=NOW_MS - 1)])
+
+    with pytest.raises(RuntimeError, match="Hyperliquid market data unavailable"):
+        CrossPerpMonitor(
+            hyperliquid=BookFailureHyperliquid(),
+            venues=[FakeExternalVenue("binance", ("ZRO",))],
+            store=store,
+            now_ms=lambda: NOW_MS,
+        ).run()
+
+    assert store.cross_perp_summary()["status"] == "failed"
+    assert store.latest_cross_perp_observations() == []
+
+
 def test_monitor_persists_market_failures_and_continues_other_assets(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()

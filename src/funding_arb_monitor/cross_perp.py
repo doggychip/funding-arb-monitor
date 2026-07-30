@@ -127,7 +127,7 @@ class CrossPerpMonitor:
             raise RuntimeError("no external perpetual catalogues available")
 
         observations: list[CrossPerpObservation] = []
-        hyperliquid_markets: dict[tuple[str, str], HyperliquidPerpMarket | Exception] = {}
+        hyperliquid_markets: dict[tuple[str, str], HyperliquidPerpMarket] = {}
         match_count = 0
         for venue, instruments in catalogues:
             for snapshot in snapshots:
@@ -141,11 +141,10 @@ class CrossPerpMonitor:
                     try:
                         hyperliquid_market = self._hyperliquid_market(snapshot)
                     except Exception as exc:
-                        hyperliquid_market = exc
+                        self._finish_failed(run_id, venue_status, str(exc))
+                        raise RuntimeError("Hyperliquid market data unavailable") from exc
                     hyperliquid_markets[market_key] = hyperliquid_market
                 try:
-                    if isinstance(hyperliquid_market, Exception):
-                        raise hyperliquid_market
                     external_market = venue.market(
                         instrument,
                         days=self.config.history_days,
@@ -235,13 +234,8 @@ class CrossPerpMonitor:
         snapshot: MarketSnapshot,
         instrument: PerpInstrument,
         direction: str,
-        hyperliquid_market: HyperliquidPerpMarket | Exception | None,
+        hyperliquid_market: HyperliquidPerpMarket,
     ) -> CrossPerpObservation:
-        market = (
-            hyperliquid_market
-            if isinstance(hyperliquid_market, HyperliquidPerpMarket)
-            else None
-        )
         return CrossPerpObservation(
             observed_at_ms=self.now_ms(),
             hyperliquid_dex=snapshot.dex,
@@ -249,9 +243,7 @@ class CrossPerpMonitor:
             external_venue=instrument.venue,
             external_symbol=instrument.symbol,
             direction=direction,
-            hyperliquid_current_funding_rate=(
-                market.current_funding_rate if market else snapshot.funding_rate
-            ),
+            hyperliquid_current_funding_rate=hyperliquid_market.current_funding_rate,
             external_current_funding_rate=None,
             hyperliquid_funding_apr_pct=None,
             external_funding_apr_pct=None,
@@ -260,7 +252,7 @@ class CrossPerpMonitor:
             expected_funding_usd=None,
             transaction_cost_usd=None,
             basis_bps=None,
-            hyperliquid_mark_price=market.mark_price if market else snapshot.mark_price,
+            hyperliquid_mark_price=hyperliquid_market.mark_price,
             external_mark_price=None,
             hyperliquid_executable_price=None,
             external_executable_price=None,
@@ -272,11 +264,9 @@ class CrossPerpMonitor:
             external_fee_bps=0.0,
             hyperliquid_history_coverage=0.0,
             external_history_coverage=0.0,
-            hyperliquid_funding_at_ms=(
-                market.funding_captured_at_ms if market else None
-            ),
+            hyperliquid_funding_at_ms=hyperliquid_market.funding_captured_at_ms,
             external_funding_at_ms=None,
-            hyperliquid_quote_at_ms=(market.quote.captured_at_ms if market else None),
+            hyperliquid_quote_at_ms=hyperliquid_market.quote.captured_at_ms,
             external_quote_at_ms=None,
             qualified=False,
             reasons=("venue_unavailable",),
