@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -589,6 +591,32 @@ class FakeExternalVenue:
         )
 
 
+class DelayedExternalVenue(FakeExternalVenue):
+    def __init__(self, name: str, assets: tuple[str, ...], *, delay: float) -> None:
+        super().__init__(name, assets)
+        self.delay = delay
+        self.market_calls: list[str] = []
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.lock = threading.Lock()
+
+    def market(
+        self, instrument: PerpInstrument, *, days: int, notional_usd: float
+    ) -> ExternalPerpMarket:
+        with self.lock:
+            self.market_calls.append(instrument.asset)
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(self.delay)
+            return super().market(
+                instrument, days=days, notional_usd=notional_usd
+            )
+        finally:
+            with self.lock:
+                self.active_calls -= 1
+
+
 def test_monitor_persists_successful_venue_when_another_catalogue_fails(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
@@ -708,6 +736,61 @@ def test_monitor_persists_market_failures_and_continues_other_assets(tmp_path) -
     }
     assert {tuple(row["reasons"]) for row in unavailable} == {("venue_unavailable",)}
     assert {row["asset"] for row in rows} == {"ZRO", "APT"}
+
+
+def test_monitor_bounds_concurrent_external_markets_without_changing_routes(
+    tmp_path,
+) -> None:
+    assets = tuple(f"ASSET{index}" for index in range(12))
+    hyperliquid = FakeHyperliquid(assets)
+    venue = DelayedExternalVenue("binance", assets, delay=0.05)
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+
+    result = CrossPerpMonitor(
+        hyperliquid=hyperliquid,
+        venues=[venue],
+        store=store,
+        now_ms=lambda: NOW_MS,
+    ).run()
+
+    assert venue.max_active_calls == 8
+    assert venue.active_calls == 0
+    assert sorted(venue.market_calls) == sorted(assets)
+    assert hyperliquid.history_calls == list(assets)
+    assert hyperliquid.quote_calls == [(asset, "(main)") for asset in assets]
+    assert result["match_count"] == len(assets)
+    assert result["evaluation_count"] == 2 * len(assets)
+    assert len(store.latest_cross_perp_observations()) == 2 * len(assets)
+
+
+def test_monitor_cancels_pending_external_markets_on_hyperliquid_failure(
+    tmp_path,
+) -> None:
+    assets = tuple(f"ASSET{index}" for index in range(10))
+
+    class LateHistoryFailureHyperliquid(FakeHyperliquid):
+        def funding_history(self, coin: str, days: int):
+            if coin == assets[-1]:
+                raise RuntimeError("funding history unavailable")
+            return super().funding_history(coin, days)
+
+    venue = DelayedExternalVenue("binance", assets, delay=0.1)
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+
+    with pytest.raises(RuntimeError, match="Hyperliquid market data unavailable"):
+        CrossPerpMonitor(
+            hyperliquid=LateHistoryFailureHyperliquid(assets),
+            venues=[venue],
+            store=store,
+            now_ms=lambda: NOW_MS,
+        ).run()
+
+    assert len(venue.market_calls) <= 8
+    assert venue.active_calls == 0
+    assert store.cross_perp_summary()["status"] == "failed"
+    assert store.latest_cross_perp_observations() == []
 
 
 def test_cli_parser_accepts_cross_perp() -> None:

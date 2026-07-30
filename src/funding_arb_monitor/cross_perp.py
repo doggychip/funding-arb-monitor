@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from statistics import median
 from typing import Callable
@@ -126,53 +127,76 @@ class CrossPerpMonitor:
             )
             raise RuntimeError("no external perpetual catalogues available")
 
-        observations: list[CrossPerpObservation] = []
         hyperliquid_markets: dict[tuple[str, str], HyperliquidPerpMarket] = {}
+        external_jobs: list[
+            tuple[
+                MarketSnapshot,
+                PerpInstrument,
+                HyperliquidPerpMarket,
+                Future[ExternalPerpMarket],
+            ]
+        ] = []
         match_count = 0
-        for venue, instruments in catalogues:
-            for snapshot in snapshots:
-                instrument = instruments.get(snapshot.coin)
-                if instrument is None:
-                    continue
-                match_count += 1
-                market_key = (snapshot.dex, snapshot.coin)
-                hyperliquid_market = hyperliquid_markets.get(market_key)
-                if hyperliquid_market is None:
-                    try:
-                        hyperliquid_market = self._hyperliquid_market(snapshot)
-                    except Exception as exc:
-                        self._finish_failed(run_id, venue_status, str(exc))
-                        raise RuntimeError("Hyperliquid market data unavailable") from exc
-                    hyperliquid_markets[market_key] = hyperliquid_market
-                try:
-                    external_market = venue.market(
+        executor = ThreadPoolExecutor(max_workers=8)
+        try:
+            for venue, instruments in catalogues:
+                for snapshot in snapshots:
+                    instrument = instruments.get(snapshot.coin)
+                    if instrument is None:
+                        continue
+                    match_count += 1
+                    market_key = (snapshot.dex, snapshot.coin)
+                    hyperliquid_market = hyperliquid_markets.get(market_key)
+                    if hyperliquid_market is None:
+                        try:
+                            hyperliquid_market = self._hyperliquid_market(snapshot)
+                        except Exception as exc:
+                            self._finish_failed(run_id, venue_status, str(exc))
+                            raise RuntimeError(
+                                "Hyperliquid market data unavailable"
+                            ) from exc
+                        hyperliquid_markets[market_key] = hyperliquid_market
+                    future = executor.submit(
+                        venue.market,
                         instrument,
                         days=self.config.history_days,
                         notional_usd=self.config.notional_usd,
                     )
-                    observations.extend(
-                        evaluate_direction(
-                            hyperliquid_market,
-                            external_market,
-                            direction,
-                            self.config,
-                            self.now_ms(),
-                        )
-                        for direction in (
-                            "short_hyperliquid_long_external",
-                            "long_hyperliquid_short_external",
-                        )
+                    external_jobs.append(
+                        (snapshot, instrument, hyperliquid_market, future)
                     )
-                except Exception:
-                    observations.extend(
-                        self._venue_unavailable_observation(
-                            snapshot, instrument, direction, hyperliquid_market
-                        )
-                        for direction in (
-                            "short_hyperliquid_long_external",
-                            "long_hyperliquid_short_external",
-                        )
+        except Exception:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        executor.shutdown(wait=True)
+
+        observations: list[CrossPerpObservation] = []
+        for snapshot, instrument, hyperliquid_market, future in external_jobs:
+            try:
+                external_market = future.result()
+                observations.extend(
+                    evaluate_direction(
+                        hyperliquid_market,
+                        external_market,
+                        direction,
+                        self.config,
+                        self.now_ms(),
                     )
+                    for direction in (
+                        "short_hyperliquid_long_external",
+                        "long_hyperliquid_short_external",
+                    )
+                )
+            except Exception:
+                observations.extend(
+                    self._venue_unavailable_observation(
+                        snapshot, instrument, direction, hyperliquid_market
+                    )
+                    for direction in (
+                        "short_hyperliquid_long_external",
+                        "long_hyperliquid_short_external",
+                    )
+                )
 
         saved = self.store.save_cross_perp_observations(
             run_id,
