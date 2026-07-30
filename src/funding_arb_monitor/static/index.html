@@ -104,6 +104,31 @@
       <div class="funnel" id="funnel-steps" style="margin-top: 12px"></div>
     </section>
 
+    <section style="margin-bottom: 18px">
+      <h2>Cross-perpetual monitoring evidence</h2>
+      <p class="subtle" id="cross-perp-status">Loading public cross-perpetual evidence…</p>
+      <div class="stats" id="cross-perp-counters" style="margin-top: 10px">
+        <div class="stat"><div class="value" id="cross-perp-evaluated">—</div><div class="label">Routes evaluated</div></div>
+        <div class="stat"><div class="value positive" id="cross-perp-positive">—</div><div class="label">Positive after costs</div></div>
+        <div class="stat"><div class="value" id="cross-perp-ready">—</div><div class="label">Observation ready</div></div>
+        <div class="stat"><div class="value" id="cross-perp-coverage">—</div><div class="label">Venue coverage</div></div>
+      </div>
+      <div class="panel">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Asset</th><th>Route</th><th>Direction</th><th>Gross 7d APR</th><th>Net 7d APR</th>
+                <th>Basis</th><th>Executable depth</th><th>Streak</th><th>Status / reasons</th><th>Data age</th>
+              </tr>
+            </thead>
+            <tbody id="cross-perp-rows"></tbody>
+          </table>
+        </div>
+        <div id="cross-perp-empty">No completed cross-perpetual observation yet. Run <code>funding-arb-monitor cross-perp</code>, then refresh this page.</div>
+      </div>
+    </section>
+
     <section class="filters" aria-label="Candidate filters">
       <label>Search market
         <input id="search" type="search" placeholder="Coin or dex">
@@ -312,6 +337,7 @@
     async function load() {
       const meta = document.querySelector("#scan-meta");
       meta.textContent = "Loading latest persisted scan…";
+      void loadCrossPerp();
       try {
         const response = await apiFetch("/api/candidates?limit=500");
         if (!response.ok) throw new Error("API request failed");
@@ -345,6 +371,76 @@
         candidates = [];
         currentCandidates = [];
         render();
+      }
+    }
+
+    async function loadCrossPerp() {
+      const status = document.querySelector("#cross-perp-status");
+      const empty = document.querySelector("#cross-perp-empty");
+      const emptyMessage = "No completed cross-perpetual observation yet. Run funding-arb-monitor cross-perp, then refresh this page.";
+      status.textContent = "Loading public cross-perpetual evidence…";
+      try {
+        const [summaryResponse, opportunitiesResponse] = await Promise.all([
+          apiFetch("/api/cross-perp/summary"),
+          apiFetch("/api/cross-perp/opportunities?limit=500")
+        ]);
+        if (!summaryResponse.ok || !opportunitiesResponse.ok) {
+          throw new Error("Cross-perp API request failed");
+        }
+        const [summary, opportunities] = await Promise.all([
+          summaryResponse.json(), opportunitiesResponse.json()
+        ]);
+        const venues = Object.entries(summary.venue_status);
+        const successfulVenues = venues.filter(([, venueStatus]) => venueStatus === "success").length;
+        document.querySelector("#cross-perp-evaluated").textContent = summary.evaluation_count;
+        document.querySelector("#cross-perp-positive").textContent = summary.positive_net_count;
+        document.querySelector("#cross-perp-ready").textContent = summary.ready_count;
+        document.querySelector("#cross-perp-coverage").textContent = venues.length
+          ? `${successfulVenues}/${venues.length}`
+          : "—";
+        status.textContent = summary.status === "never_run"
+          ? "No completed cross-perpetual run yet."
+          : `Latest cross-perpetual run: ${summary.status} · Venue coverage: ${successfulVenues}/${venues.length}`;
+        document.querySelector("#cross-perp-rows").innerHTML = opportunities.map((row) => {
+          const route = `Hyperliquid ${row.hyperliquid_dex} → ${row.external_venue} ${row.external_symbol}`;
+          const direction = row.direction === "short_hyperliquid_long_external"
+            ? "Short Hyperliquid / Long external"
+            : "Long Hyperliquid / Short external";
+          const routeStatus = row.qualified
+            ? row.streak >= 3
+              ? "Observation ready"
+              : `Monitoring (${row.streak}/3)`
+            : row.reasons.join(", ").replaceAll("_", " ");
+          const executableDepth = Math.min(
+            row.hyperliquid_depth_usd ?? 0,
+            row.external_depth_usd ?? 0
+          );
+          return `
+            <tr>
+              <td>${escapeHtml(row.asset)}</td>
+              <td>${escapeHtml(route)}</td>
+              <td>${escapeHtml(direction)}</td>
+              <td class="${numberClass(row.gross_spread_apr_pct)}">${percent(row.gross_spread_apr_pct)}</td>
+              <td class="${numberClass(row.net_apr_7d_pct)}">${percent(row.net_apr_7d_pct)}</td>
+              <td class="${numberClass(row.basis_bps)}">${row.basis_bps == null ? "—" : `${row.basis_bps.toFixed(1)} bps`}</td>
+              <td>${money.format(executableDepth)}</td>
+              <td>${row.streak}/3</td>
+              <td><span class="badge ${row.qualified ? "eligible" : "review"}">${escapeHtml(routeStatus)}</span></td>
+              <td title="${escapeHtml(new Date(row.observed_at_ms).toLocaleString())}">${analysisAge(new Date(row.observed_at_ms).toISOString())}</td>
+            </tr>
+          `;
+        }).join("");
+        empty.textContent = emptyMessage;
+        empty.style.display = opportunities.length ? "none" : "block";
+      } catch (error) {
+        status.textContent = "Cross-perpetual evidence is unavailable; spot-perpetual monitoring remains available.";
+        document.querySelector("#cross-perp-evaluated").textContent = "—";
+        document.querySelector("#cross-perp-positive").textContent = "—";
+        document.querySelector("#cross-perp-ready").textContent = "—";
+        document.querySelector("#cross-perp-coverage").textContent = "—";
+        document.querySelector("#cross-perp-rows").innerHTML = "";
+        empty.textContent = "Could not load cross-perpetual evidence. Refresh to retry.";
+        empty.style.display = "block";
       }
     }
 

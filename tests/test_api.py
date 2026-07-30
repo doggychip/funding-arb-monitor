@@ -250,6 +250,12 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert 'id="no-hedge-count"' in dashboard.text
     assert 'id="paper-progress"' in dashboard.text
     assert 'id="funnel-steps"' in dashboard.text
+    assert 'id="cross-perp-status"' in dashboard.text
+    assert 'id="cross-perp-counters"' in dashboard.text
+    assert 'id="cross-perp-rows"' in dashboard.text
+    assert 'id="cross-perp-empty"' in dashboard.text
+    assert "Observation ready" in dashboard.text
+    assert "Actionable cross-perp" not in dashboard.text
     assert 'id="rejection-rows"' in dashboard.text
     assert 'id="strategy-rows"' in dashboard.text
     assert "monitoring eligible" in dashboard.text

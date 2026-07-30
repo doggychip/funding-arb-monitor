@@ -83,6 +83,28 @@ available, including public two-sided perp slippage. Thirty-day rejection analyt
 monitoring gates and execution outcomes. Strategy analytics group closed paper results by coin,
 venue, holding period, entry net APR, gross-carry regime, and exit reason.
 
+## Cross-perpetual monitoring
+
+Run the separate public cross-perpetual evidence scan with its fixed $1,000 notional:
+
+```bash
+funding-arb-monitor --db data/funding_arb.db cross-perp
+```
+
+It compares Hyperliquid with Binance and OKX perpetual markets in both directions: short
+Hyperliquid/long external and long Hyperliquid/short external. For each matching route it records
+seven-day gross and net carry, executable two-sided depth, basis, and rejection reasons. A route is
+qualified only when public history and quotes are fresh, both legs can fill the $1,000 notional,
+basis is within the configured limit, and the seven-day net carry remains positive after fees and
+slippage. A qualified route becomes `Observation ready` only after three consecutive qualifying
+scans; that label is evidence for monitoring, never an execution signal.
+
+The protected read endpoints are `GET /api/cross-perp/summary`,
+`GET /api/cross-perp/opportunities`, and `GET /api/cross-perp/history`. They expose monitoring
+evidence only: this feature remains read-only, accepts no exchange credentials, and is not
+actionable or approved for trading. Cross-perpetual degradation is shown in the dashboard and
+summary endpoint but is non-critical to `/readyz`.
+
 ## Paper positions
 
 Paper positions are accounting entries only; they never create exchange orders or use credentials.
