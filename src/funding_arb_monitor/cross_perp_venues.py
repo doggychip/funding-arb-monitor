@@ -151,10 +151,15 @@ class BinancePerpVenue:
                     or symbol.get("quoteAsset") != "USDT"
                 ):
                     continue
-                asset = str(symbol["baseAsset"])
-                market_symbol = str(symbol["symbol"])
-                if not asset or not market_symbol:
-                    raise ValueError
+                asset = symbol["baseAsset"]
+                market_symbol = symbol["symbol"]
+                if (
+                    not isinstance(asset, str)
+                    or not asset
+                    or not isinstance(market_symbol, str)
+                    or not market_symbol
+                ):
+                    raise TypeError
                 instruments[asset] = PerpInstrument(self.name, asset, market_symbol)
             return instruments
         except (KeyError, TypeError, ValueError) as exc:
@@ -229,9 +234,11 @@ class OkxPerpVenue:
                     or instrument.get("settleCcy") not in {"USDT", "USDC"}
                 ):
                     continue
-                underlying = str(instrument["uly"])
+                underlying = instrument["uly"]
+                market_symbol = instrument["instId"]
+                if not isinstance(underlying, str) or not isinstance(market_symbol, str):
+                    raise TypeError
                 asset = underlying.split("-", 1)[0]
-                market_symbol = str(instrument["instId"])
                 if not asset or "-" not in underlying or not market_symbol:
                     raise ValueError
                 existing = selected.get(asset)

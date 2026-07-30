@@ -224,3 +224,65 @@ def test_discovery_rejects_malformed_top_level_payloads(venue) -> None:
 def test_discovery_rejects_malformed_matching_records(venue) -> None:
     with pytest.raises(RuntimeError, match="instrument response"):
         venue.instruments()
+
+
+@pytest.mark.parametrize(
+    "venue",
+    [
+        BinancePerpVenue(
+            get_json=lambda _: {
+                "symbols": [
+                    {
+                        "symbol": "ZROUSDT",
+                        "baseAsset": None,
+                        "quoteAsset": "USDT",
+                        "contractType": "PERPETUAL",
+                        "status": "TRADING",
+                    }
+                ]
+            }
+        ),
+        BinancePerpVenue(
+            get_json=lambda _: {
+                "symbols": [
+                    {
+                        "symbol": None,
+                        "baseAsset": "ZRO",
+                        "quoteAsset": "USDT",
+                        "contractType": "PERPETUAL",
+                        "status": "TRADING",
+                    }
+                ]
+            }
+        ),
+        OkxPerpVenue(
+            get_json=lambda _: {
+                "data": [
+                    {
+                        "instId": None,
+                        "uly": "ZRO-USDT",
+                        "settleCcy": "USDT",
+                        "ctType": "linear",
+                        "state": "live",
+                    }
+                ]
+            }
+        ),
+        OkxPerpVenue(
+            get_json=lambda _: {
+                "data": [
+                    {
+                        "instId": "ZRO-USDT-SWAP",
+                        "uly": None,
+                        "settleCcy": "USDT",
+                        "ctType": "linear",
+                        "state": "live",
+                    }
+                ]
+            }
+        ),
+    ],
+)
+def test_discovery_rejects_null_required_matching_fields(venue) -> None:
+    with pytest.raises(RuntimeError, match="instrument response"):
+        venue.instruments()
