@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass
 from statistics import median
+from typing import Callable
 
 from funding_arb_monitor.cross_perp_venues import (
+    ExternalPerpVenue,
     ExternalPerpMarket,
     PerpBookQuote,
     PerpFundingEvent,
+    PerpInstrument,
 )
+from funding_arb_monitor.models import MarketSnapshot, PerpQuote
+from funding_arb_monitor.store import Store
 
 
 YEAR_MS = 365 * 86_400_000
@@ -77,6 +83,222 @@ class CrossPerpObservation:
         result = asdict(self)
         result["reasons"] = list(self.reasons)
         return result
+
+
+class CrossPerpMonitor:
+    def __init__(
+        self,
+        hyperliquid: object,
+        venues: list[ExternalPerpVenue],
+        store: Store,
+        *,
+        config: CrossPerpConfig = CrossPerpConfig(),
+        now_ms: Callable[[], int] | None = None,
+    ) -> None:
+        self.hyperliquid = hyperliquid
+        self.venues = venues
+        self.store = store
+        self.config = config
+        self.now_ms = now_ms or (lambda: int(time.time() * 1_000))
+
+    def run(self) -> dict[str, object]:
+        run_id = self.store.start_cross_perp_run()
+        venue_status: dict[str, str] = {}
+        try:
+            snapshots = self.hyperliquid.snapshots()
+        except Exception as exc:
+            self._finish_failed(run_id, venue_status, str(exc))
+            raise RuntimeError("Hyperliquid market data unavailable") from exc
+
+        catalogues: list[tuple[ExternalPerpVenue, dict[str, PerpInstrument]]] = []
+        for venue in self.venues:
+            try:
+                instruments = venue.instruments()
+            except Exception as exc:
+                venue_status[venue.name] = f"failed: {exc}"
+                continue
+            venue_status[venue.name] = "success"
+            catalogues.append((venue, instruments))
+
+        if not catalogues:
+            self._finish_failed(
+                run_id, venue_status, "no external perpetual catalogues available"
+            )
+            raise RuntimeError("no external perpetual catalogues available")
+
+        observations: list[CrossPerpObservation] = []
+        hyperliquid_markets: dict[tuple[str, str], HyperliquidPerpMarket | Exception] = {}
+        match_count = 0
+        for venue, instruments in catalogues:
+            for snapshot in snapshots:
+                instrument = instruments.get(snapshot.coin)
+                if instrument is None:
+                    continue
+                match_count += 1
+                market_key = (snapshot.dex, snapshot.coin)
+                hyperliquid_market = hyperliquid_markets.get(market_key)
+                if hyperliquid_market is None:
+                    try:
+                        hyperliquid_market = self._hyperliquid_market(snapshot)
+                    except Exception as exc:
+                        hyperliquid_market = exc
+                    hyperliquid_markets[market_key] = hyperliquid_market
+                try:
+                    if isinstance(hyperliquid_market, Exception):
+                        raise hyperliquid_market
+                    external_market = venue.market(
+                        instrument,
+                        days=self.config.history_days,
+                        notional_usd=self.config.notional_usd,
+                    )
+                    observations.extend(
+                        evaluate_direction(
+                            hyperliquid_market,
+                            external_market,
+                            direction,
+                            self.config,
+                            self.now_ms(),
+                        )
+                        for direction in (
+                            "short_hyperliquid_long_external",
+                            "long_hyperliquid_short_external",
+                        )
+                    )
+                except Exception:
+                    observations.extend(
+                        self._venue_unavailable_observation(
+                            snapshot, instrument, direction, hyperliquid_market
+                        )
+                        for direction in (
+                            "short_hyperliquid_long_external",
+                            "long_hyperliquid_short_external",
+                        )
+                    )
+
+        saved = self.store.save_cross_perp_observations(
+            run_id,
+            observations,
+            continuity_window_ms=self.config.continuity_window_ms,
+        )
+        self.store.finish_cross_perp_run(
+            run_id,
+            status="success",
+            venue_status=venue_status,
+            match_count=match_count,
+            evaluation_count=len(saved),
+            positive_net_count=sum(
+                item["net_apr_7d_pct"] is not None and item["net_apr_7d_pct"] > 0
+                for item in saved
+            ),
+            ready_count=sum(bool(item["observation_ready"]) for item in saved),
+        )
+        return self.store.cross_perp_summary()
+
+    def _finish_failed(
+        self, run_id: int, venue_status: dict[str, str], error: str
+    ) -> None:
+        self.store.finish_cross_perp_run(
+            run_id,
+            status="failed",
+            venue_status=venue_status,
+            match_count=0,
+            evaluation_count=0,
+            positive_net_count=0,
+            ready_count=0,
+            error=error,
+        )
+
+    def _hyperliquid_market(self, snapshot: MarketSnapshot) -> HyperliquidPerpMarket:
+        history = self.hyperliquid.funding_history(
+            snapshot.coin, self.config.history_days
+        )
+        quote = self.hyperliquid.perp_quote(
+            snapshot.coin, snapshot.dex, self.config.notional_usd
+        )
+        if quote is None:
+            raise RuntimeError("Hyperliquid perpetual order book unavailable")
+        return HyperliquidPerpMarket(
+            dex=snapshot.dex,
+            asset=snapshot.coin,
+            current_funding_rate=snapshot.funding_rate,
+            mark_price=snapshot.mark_price,
+            funding_captured_at_ms=int(snapshot.captured_at.timestamp() * 1_000),
+            funding_events=tuple(
+                PerpFundingEvent(event.timestamp_ms, event.funding_rate)
+                for event in history
+            ),
+            quote=_hyperliquid_book_quote(snapshot, quote, self.config.hyperliquid_fee_bps),
+        )
+
+    def _venue_unavailable_observation(
+        self,
+        snapshot: MarketSnapshot,
+        instrument: PerpInstrument,
+        direction: str,
+        hyperliquid_market: HyperliquidPerpMarket | Exception | None,
+    ) -> CrossPerpObservation:
+        market = (
+            hyperliquid_market
+            if isinstance(hyperliquid_market, HyperliquidPerpMarket)
+            else None
+        )
+        return CrossPerpObservation(
+            observed_at_ms=self.now_ms(),
+            hyperliquid_dex=snapshot.dex,
+            asset=snapshot.coin,
+            external_venue=instrument.venue,
+            external_symbol=instrument.symbol,
+            direction=direction,
+            hyperliquid_current_funding_rate=(
+                market.current_funding_rate if market else snapshot.funding_rate
+            ),
+            external_current_funding_rate=None,
+            hyperliquid_funding_apr_pct=None,
+            external_funding_apr_pct=None,
+            gross_spread_apr_pct=None,
+            net_apr_7d_pct=None,
+            expected_funding_usd=None,
+            transaction_cost_usd=None,
+            basis_bps=None,
+            hyperliquid_mark_price=market.mark_price if market else snapshot.mark_price,
+            external_mark_price=None,
+            hyperliquid_executable_price=None,
+            external_executable_price=None,
+            hyperliquid_slippage_bps=None,
+            external_slippage_bps=None,
+            hyperliquid_depth_usd=0.0,
+            external_depth_usd=0.0,
+            hyperliquid_fee_bps=self.config.hyperliquid_fee_bps,
+            external_fee_bps=0.0,
+            hyperliquid_history_coverage=0.0,
+            external_history_coverage=0.0,
+            hyperliquid_funding_at_ms=(
+                market.funding_captured_at_ms if market else None
+            ),
+            external_funding_at_ms=None,
+            hyperliquid_quote_at_ms=(market.quote.captured_at_ms if market else None),
+            external_quote_at_ms=None,
+            qualified=False,
+            reasons=("venue_unavailable",),
+        )
+
+
+def _hyperliquid_book_quote(
+    snapshot: MarketSnapshot, quote: PerpQuote, fee_bps: float
+) -> PerpBookQuote:
+    return PerpBookQuote(
+        venue="hyperliquid",
+        asset=snapshot.coin,
+        symbol=snapshot.coin,
+        bid=quote.bid,
+        ask=quote.ask,
+        executable_buy_price=quote.executable_buy_price,
+        executable_sell_price=quote.executable_sell_price,
+        bid_depth_usd=quote.bid_depth_usd,
+        ask_depth_usd=quote.ask_depth_usd,
+        fee_bps=fee_bps,
+        captured_at_ms=quote.captured_at_ms,
+    )
 
 
 def realized_funding_apr(

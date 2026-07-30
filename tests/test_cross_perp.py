@@ -1,9 +1,13 @@
+import sys
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
+import funding_arb_monitor.cli as cli
 from funding_arb_monitor.cross_perp import (
     CrossPerpConfig,
+    CrossPerpMonitor,
     HyperliquidPerpMarket,
     evaluate_direction,
     realized_funding_apr,
@@ -14,6 +18,7 @@ from funding_arb_monitor.cross_perp_venues import (
     PerpFundingEvent,
     PerpInstrument,
 )
+from funding_arb_monitor.models import MarketSnapshot, PerpQuote
 from funding_arb_monitor.store import Store
 
 
@@ -498,3 +503,187 @@ def test_cross_perp_summary_decodes_venue_status_and_rejections(tmp_path) -> Non
     assert summary["status"] == "success"
     assert summary["venue_status"] == {"binance": "success", "okx": "failed"}
     assert summary["rejection_counts"] == {"insufficient_depth": 1, "stale_quote": 1}
+
+
+class FakeHyperliquid:
+    def __init__(self, assets: tuple[str, ...] = ("ZRO",)) -> None:
+        self.assets = assets
+        self.history_calls: list[str] = []
+        self.quote_calls: list[tuple[str, str]] = []
+
+    def snapshots(self) -> list[MarketSnapshot]:
+        return [
+            MarketSnapshot(
+                dex="(main)",
+                coin=asset,
+                funding_rate=0.0001,
+                open_interest_usd=1_000_000.0,
+                day_volume_usd=1_000_000.0,
+                mark_price=100.0,
+                captured_at=datetime.fromtimestamp(NOW_MS / 1_000, tz=timezone.utc),
+            )
+            for asset in self.assets
+        ]
+
+    def funding_history(self, coin: str, days: int):
+        assert days == 7
+        self.history_calls.append(coin)
+        return _funding_events(30.0)
+
+    def perp_quote(self, coin: str, dex: str, notional_usd: float) -> PerpQuote:
+        assert notional_usd == 1_000.0
+        self.quote_calls.append((coin, dex))
+        return PerpQuote(
+            coin=coin,
+            dex=dex,
+            bid=99.99,
+            ask=100.01,
+            executable_sell_price=99.95,
+            executable_buy_price=100.05,
+            bid_depth_usd=2_000.0,
+            ask_depth_usd=2_000.0,
+            captured_at_ms=NOW_MS - 1_000,
+        )
+
+
+class FakeExternalVenue:
+    def __init__(
+        self,
+        name: str,
+        assets: tuple[str, ...],
+        *,
+        catalogue_error: str | None = None,
+        market_errors: tuple[str, ...] = (),
+    ) -> None:
+        self.name = name
+        self.assets = assets
+        self.catalogue_error = catalogue_error
+        self.market_errors = market_errors
+
+    def instruments(self) -> dict[str, PerpInstrument]:
+        if self.catalogue_error:
+            raise RuntimeError(self.catalogue_error)
+        return {
+            asset: PerpInstrument(self.name, asset, f"{asset}USDT")
+            for asset in self.assets
+        }
+
+    def market(
+        self, instrument: PerpInstrument, *, days: int, notional_usd: float
+    ) -> ExternalPerpMarket:
+        assert days == 7
+        assert notional_usd == 1_000.0
+        if instrument.asset in self.market_errors:
+            raise RuntimeError(f"{instrument.asset} unavailable")
+        return ExternalPerpMarket(
+            instrument=instrument,
+            current_funding_rate=0.0001,
+            mark_price=100.0,
+            funding_captured_at_ms=NOW_MS - 1_000,
+            funding_events=_funding_events(10.0),
+            quote=_quote(
+                venue=self.name,
+                executable_buy_price=100.04,
+                executable_sell_price=99.96,
+            ),
+        )
+
+
+def test_monitor_persists_successful_venue_when_another_catalogue_fails(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    hyperliquid = FakeHyperliquid()
+
+    result = CrossPerpMonitor(
+        hyperliquid=hyperliquid,
+        venues=[
+            FakeExternalVenue("binance", ("ZRO",)),
+            FakeExternalVenue("okx", ("ZRO",), catalogue_error="unavailable"),
+        ],
+        store=store,
+        now_ms=lambda: NOW_MS,
+    ).run()
+
+    assert result["status"] == "success"
+    assert result["venue_status"] == {
+        "binance": "success",
+        "okx": "failed: unavailable",
+    }
+    assert result["match_count"] == 1
+    assert result["evaluation_count"] == 2
+    assert {
+        row["direction"] for row in store.latest_cross_perp_observations()
+    } == {
+        "short_hyperliquid_long_external",
+        "long_hyperliquid_short_external",
+    }
+    assert hyperliquid.history_calls == ["ZRO"]
+    assert hyperliquid.quote_calls == [("ZRO", "(main)")]
+
+
+def test_monitor_fails_when_all_external_catalogues_fail_without_copying_stale_rows(
+    tmp_path,
+) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(store, [qualifying_observation(observed_at_ms=NOW_MS - 1)])
+
+    with pytest.raises(RuntimeError, match="no external perpetual catalogues"):
+        CrossPerpMonitor(
+            hyperliquid=FakeHyperliquid(),
+            venues=[
+                FakeExternalVenue("binance", (), catalogue_error="down"),
+                FakeExternalVenue("okx", (), catalogue_error="down"),
+            ],
+            store=store,
+            now_ms=lambda: NOW_MS,
+        ).run()
+
+    assert store.cross_perp_summary()["status"] == "failed"
+    assert store.latest_cross_perp_observations() == []
+
+
+def test_monitor_persists_market_failures_and_continues_other_assets(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+
+    result = CrossPerpMonitor(
+        hyperliquid=FakeHyperliquid(("ZRO", "APT")),
+        venues=[FakeExternalVenue("binance", ("ZRO", "APT"), market_errors=("ZRO",))],
+        store=store,
+        now_ms=lambda: NOW_MS,
+    ).run()
+
+    rows = store.latest_cross_perp_observations()
+    unavailable = [row for row in rows if row["asset"] == "ZRO"]
+    assert result["evaluation_count"] == 4
+    assert len(unavailable) == 2
+    assert {row["direction"] for row in unavailable} == {
+        "short_hyperliquid_long_external",
+        "long_hyperliquid_short_external",
+    }
+    assert {tuple(row["reasons"]) for row in unavailable} == {("venue_unavailable",)}
+    assert {row["asset"] for row in rows} == {"ZRO", "APT"}
+
+
+def test_cli_parser_accepts_cross_perp() -> None:
+    args = cli.parser().parse_args(["--db", "test.db", "cross-perp"])
+
+    assert args.command == "cross-perp"
+
+
+def test_cli_cross_perp_prints_summary(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli.CrossPerpMonitor,
+        "run",
+        lambda _: {"status": "success", "match_count": 1},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["funding-arb-monitor", "--db", str(tmp_path / "test.db"), "cross-perp"],
+    )
+
+    cli.main()
+
+    assert '"status": "success"' in capsys.readouterr().out

@@ -13,6 +13,8 @@ from .alerts import (
     send_webhook,
 )
 from .api import create_app
+from .cross_perp import CrossPerpMonitor
+from .cross_perp_venues import BinancePerpVenue, OkxPerpVenue
 from .hyperliquid import HyperliquidClient
 from .matcher import PaperMatcher
 from .maintenance import backup_database, integrity_check
@@ -42,6 +44,11 @@ def parser() -> argparse.ArgumentParser:
     serve = subcommands.add_parser("serve", help="serve the read-only candidates API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
+
+    subcommands.add_parser(
+        "cross-perp",
+        help="monitor public Hyperliquid versus Binance and OKX perpetual carry",
+    )
 
     paper = subcommands.add_parser("paper", help="manage simulated paired positions; never places orders")
     paper_commands = paper.add_subparsers(dest="paper_command", required=True)
@@ -128,6 +135,15 @@ def main() -> None:
         return
 
     store.initialize()
+    if args.command == "cross-perp":
+        result = CrossPerpMonitor(
+            HyperliquidClient(),
+            [BinancePerpVenue(), OkxPerpVenue()],
+            store,
+        ).run()
+        print(json.dumps(result, indent=2))
+        return
+
     if args.command == "paper":
         ledger = PaperLedger(store)
         if args.paper_command == "open":
