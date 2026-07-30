@@ -83,6 +83,39 @@ class Store:
                     failed_market_count INTEGER NOT NULL DEFAULT 0,
                     error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS cross_perp_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at_ms INTEGER NOT NULL,
+                    completed_at_ms INTEGER,
+                    status TEXT NOT NULL,
+                    venue_status_json TEXT NOT NULL DEFAULT '{}',
+                    match_count INTEGER NOT NULL DEFAULT 0,
+                    evaluation_count INTEGER NOT NULL DEFAULT 0,
+                    positive_net_count INTEGER NOT NULL DEFAULT 0,
+                    ready_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS cross_perp_observations (
+                    run_id INTEGER NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    hyperliquid_dex TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    external_venue TEXT NOT NULL,
+                    external_symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    qualified INTEGER NOT NULL,
+                    streak INTEGER NOT NULL,
+                    observation_ready INTEGER NOT NULL,
+                    net_apr_7d_pct REAL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (
+                        run_id, hyperliquid_dex, asset, external_venue,
+                        external_symbol, direction
+                    ),
+                    FOREIGN KEY (run_id) REFERENCES cross_perp_runs(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_cross_perp_latest
+                ON cross_perp_observations(run_id, observation_ready, net_apr_7d_pct);
                 CREATE TABLE IF NOT EXISTS paper_recommendations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at_ms INTEGER NOT NULL,
@@ -346,6 +379,202 @@ class Store:
                 """
             ).fetchone()
         return dict(row) if row else None
+
+    def start_cross_perp_run(self) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO cross_perp_runs (started_at_ms, status) VALUES (?, 'running')",
+                (int(time.time() * 1000),),
+            )
+        return int(cursor.lastrowid)
+
+    def save_cross_perp_observations(
+        self, run_id: int, observations: list[object], *, continuity_window_ms: int
+    ) -> list[dict[str, object]]:
+        saved: list[dict[str, object]] = []
+        with self.connect() as connection:
+            previous_run = connection.execute(
+                """
+                SELECT id, status FROM cross_perp_runs
+                WHERE id < ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            for observation in observations:
+                payload = observation.as_dict()
+                qualified = bool(payload["qualified"])
+                streak = 0
+                if qualified:
+                    previous_observation = None
+                    if previous_run and previous_run["status"] == "success":
+                        previous_observation = connection.execute(
+                            """
+                            SELECT observed_at_ms, qualified, streak
+                            FROM cross_perp_observations
+                            WHERE run_id = ?
+                                AND hyperliquid_dex = ?
+                                AND asset = ?
+                                AND external_venue = ?
+                                AND external_symbol = ?
+                                AND direction = ?
+                            """,
+                            (
+                                previous_run["id"],
+                                payload["hyperliquid_dex"],
+                                payload["asset"],
+                                payload["external_venue"],
+                                payload["external_symbol"],
+                                payload["direction"],
+                            ),
+                        ).fetchone()
+                    if (
+                        previous_observation
+                        and previous_observation["qualified"]
+                        and 0
+                        <= int(payload["observed_at_ms"])
+                        - int(previous_observation["observed_at_ms"])
+                        <= continuity_window_ms
+                    ):
+                        streak = int(previous_observation["streak"]) + 1
+                    else:
+                        streak = 1
+                observation_ready = streak >= 3
+                payload["streak"] = streak
+                payload["observation_ready"] = observation_ready
+                connection.execute(
+                    """
+                    INSERT INTO cross_perp_observations (
+                        run_id, observed_at_ms, hyperliquid_dex, asset,
+                        external_venue, external_symbol, direction, qualified,
+                        streak, observation_ready, net_apr_7d_pct, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        payload["observed_at_ms"],
+                        payload["hyperliquid_dex"],
+                        payload["asset"],
+                        payload["external_venue"],
+                        payload["external_symbol"],
+                        payload["direction"],
+                        int(qualified),
+                        streak,
+                        int(observation_ready),
+                        payload["net_apr_7d_pct"],
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                saved.append({"run_id": run_id, **payload})
+        return saved
+
+    def finish_cross_perp_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        venue_status: dict[str, object],
+        match_count: int,
+        evaluation_count: int,
+        positive_net_count: int,
+        ready_count: int,
+        error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE cross_perp_runs
+                SET completed_at_ms = ?, status = ?, venue_status_json = ?,
+                    match_count = ?, evaluation_count = ?, positive_net_count = ?,
+                    ready_count = ?, error = ?
+                WHERE id = ?
+                """,
+                (
+                    int(time.time() * 1000),
+                    status,
+                    json.dumps(venue_status, separators=(",", ":")),
+                    match_count,
+                    evaluation_count,
+                    positive_net_count,
+                    ready_count,
+                    error[:500] if error else None,
+                    run_id,
+                ),
+            )
+
+    def cross_perp_summary(self) -> dict[str, object]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM cross_perp_runs
+                WHERE completed_at_ms IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return {
+                "status": "never_run",
+                "venue_status": {},
+                "match_count": 0,
+                "evaluation_count": 0,
+                "positive_net_count": 0,
+                "ready_count": 0,
+                "rejection_counts": {},
+            }
+        result = dict(row)
+        result["venue_status"] = json.loads(str(result.pop("venue_status_json")))
+        with self.connect() as connection:
+            observation_rows = connection.execute(
+                "SELECT payload_json FROM cross_perp_observations WHERE run_id = ?",
+                (result["id"],),
+            ).fetchall()
+        rejection_counts: dict[str, int] = {}
+        for observation in observation_rows:
+            for reason in json.loads(observation["payload_json"]).get("reasons", []):
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+        result["rejection_counts"] = dict(
+            sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        return result
+
+    def latest_cross_perp_observations(
+        self, limit: int = 100, *, observation_ready_only: bool = False
+    ) -> list[dict[str, object]]:
+        ready_clause = "AND observation_ready = 1" if observation_ready_only else ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM cross_perp_observations
+                WHERE run_id = (
+                    SELECT id FROM cross_perp_runs
+                    WHERE completed_at_ms IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                {ready_clause}
+                ORDER BY net_apr_7d_pct IS NULL, net_apr_7d_pct DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._cross_perp_row(row) for row in rows]
+
+    def cross_perp_history(
+        self, asset: str, external_venue: str, direction: str, limit: int = 100
+    ) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM cross_perp_observations
+                WHERE asset = ? AND external_venue = ? AND direction = ?
+                ORDER BY observed_at_ms DESC, run_id DESC
+                LIMIT ?
+                """,
+                (asset, external_venue, direction, limit),
+            ).fetchall()
+        return [self._cross_perp_row(row) for row in rows]
 
     def start_scheduled_job(self, name: str, scheduled_slot: str) -> int:
         with self.connect() as connection:
@@ -1002,6 +1231,28 @@ class Store:
             )
             output.append(candidate)
         return output
+
+    @staticmethod
+    def _cross_perp_row(row: sqlite3.Row) -> dict[str, object]:
+        result = json.loads(row["payload_json"])
+        indexed_columns = (
+            "run_id",
+            "observed_at_ms",
+            "hyperliquid_dex",
+            "asset",
+            "external_venue",
+            "external_symbol",
+            "direction",
+            "streak",
+            "net_apr_7d_pct",
+        )
+        result.update({column: row[column] for column in indexed_columns})
+        result["qualified"] = bool(row["qualified"])
+        result["observation_ready"] = bool(row["observation_ready"])
+        result["observation_age_seconds"] = max(
+            0, int(time.time() - int(row["observed_at_ms"]) / 1000)
+        )
+        return result
 
     def latest_candidate(self, coin: str) -> dict[str, object] | None:
         with self.connect() as connection:

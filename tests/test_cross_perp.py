@@ -14,6 +14,7 @@ from funding_arb_monitor.cross_perp_venues import (
     PerpFundingEvent,
     PerpInstrument,
 )
+from funding_arb_monitor.store import Store
 
 
 def test_realized_funding_apr_normalizes_eight_hour_events() -> None:
@@ -100,6 +101,20 @@ def _markets() -> tuple[HyperliquidPerpMarket, ExternalPerpMarket]:
         ),
     )
     return hyperliquid, external
+
+
+def qualifying_observation(*, observed_at_ms: int):
+    hyperliquid, external = _markets()
+    return replace(
+        evaluate_direction(
+            hyperliquid,
+            external,
+            "short_hyperliquid_long_external",
+            CrossPerpConfig(),
+            NOW_MS,
+        ),
+        observed_at_ms=observed_at_ms,
+    )
 
 
 def test_evaluate_direction_calculates_both_executable_carry_routes() -> None:
@@ -268,3 +283,218 @@ def test_evaluate_direction_keeps_multiple_reasons_in_rule_order() -> None:
         "insufficient_depth",
         "basis_too_wide",
     )
+
+
+def test_cross_perp_observations_round_trip(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    run_id = store.start_cross_perp_run()
+    saved = store.save_cross_perp_observations(
+        run_id,
+        [qualifying_observation(observed_at_ms=1_000)],
+        continuity_window_ms=5_400_000,
+    )
+    store.finish_cross_perp_run(
+        run_id,
+        status="success",
+        venue_status={"binance": "success", "okx": "success"},
+        match_count=1,
+        evaluation_count=1,
+        positive_net_count=1,
+        ready_count=0,
+    )
+
+    assert saved[0]["streak"] == 1
+    assert saved[0]["observation_ready"] is False
+    assert store.latest_cross_perp_observations()[0]["asset"] == "ZRO"
+
+
+def _save_cross_perp_run(
+    store: Store,
+    observations: list,
+    *,
+    status: str = "success",
+    venue_status: dict[str, str] | None = None,
+):
+    run_id = store.start_cross_perp_run()
+    saved = store.save_cross_perp_observations(
+        run_id, observations, continuity_window_ms=5_400_000
+    )
+    store.finish_cross_perp_run(
+        run_id,
+        status=status,
+        venue_status=venue_status or {"binance": status},
+        match_count=len(observations),
+        evaluation_count=len(observations),
+        positive_net_count=sum(item.qualified for item in observations),
+        ready_count=sum(item["observation_ready"] for item in saved),
+    )
+    return saved
+
+
+def test_cross_perp_qualification_requires_three_consecutive_successful_runs(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+
+    saved = [
+        _save_cross_perp_run(
+            store, [qualifying_observation(observed_at_ms=1_000)]
+        )[0],
+        _save_cross_perp_run(
+            store, [qualifying_observation(observed_at_ms=3_601_000)]
+        )[0],
+        _save_cross_perp_run(
+            store, [qualifying_observation(observed_at_ms=7_201_000)]
+        )[0],
+    ]
+
+    assert [item["streak"] for item in saved] == [1, 2, 3]
+    assert [item["observation_ready"] for item in saved] == [False, False, True]
+    assert store.cross_perp_history(
+        "ZRO", "binance", "short_hyperliquid_long_external"
+    )[0]["streak"] == 3
+
+
+@pytest.mark.parametrize(
+    ("previous", "next"),
+    [
+        (
+            replace(
+                qualifying_observation(observed_at_ms=1_000),
+                qualified=False,
+                reasons=("net_carry_non_positive",),
+            ),
+            qualifying_observation(observed_at_ms=3_601_000),
+        ),
+        (
+            qualifying_observation(observed_at_ms=1_000),
+            qualifying_observation(observed_at_ms=5_401_001),
+        ),
+        (
+            replace(qualifying_observation(observed_at_ms=1_000), direction="long_hyperliquid_short_external"),
+            qualifying_observation(observed_at_ms=3_601_000),
+        ),
+        (
+            replace(qualifying_observation(observed_at_ms=1_000), external_venue="okx"),
+            qualifying_observation(observed_at_ms=3_601_000),
+        ),
+    ],
+    ids=["non_qualifying", "time_gap", "direction_change", "venue_change"],
+)
+def test_cross_perp_qualification_resets_when_previous_route_cannot_continue(
+    tmp_path, previous, next
+) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(store, [previous])
+
+    saved = _save_cross_perp_run(store, [next])
+
+    assert saved[0]["streak"] == 1
+    assert saved[0]["observation_ready"] is False
+
+
+def test_cross_perp_qualification_resets_when_previous_successful_run_omits_route(
+    tmp_path,
+) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(store, [qualifying_observation(observed_at_ms=1_000)])
+    _save_cross_perp_run(store, [])
+
+    saved = _save_cross_perp_run(
+        store, [qualifying_observation(observed_at_ms=7_201_000)]
+    )
+
+    assert saved[0]["streak"] == 1
+
+
+def test_cross_perp_qualification_resets_after_a_failed_run(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(store, [qualifying_observation(observed_at_ms=1_000)])
+    _save_cross_perp_run(store, [], status="failed")
+
+    saved = _save_cross_perp_run(
+        store, [qualifying_observation(observed_at_ms=7_201_000)]
+    )
+
+    assert saved[0]["streak"] == 1
+
+
+def test_latest_cross_perp_observations_rank_ready_routes_and_hide_stale_runs(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    first = qualifying_observation(observed_at_ms=1_000)
+    second = replace(
+        qualifying_observation(observed_at_ms=1_000),
+        external_symbol="ZROUSDC",
+        net_apr_7d_pct=40.0,
+    )
+    third = replace(
+        qualifying_observation(observed_at_ms=1_000),
+        asset="ETH",
+        external_symbol="ETHUSDT",
+        net_apr_7d_pct=None,
+    )
+    non_ready = replace(
+        qualifying_observation(observed_at_ms=7_201_000),
+        asset="APT",
+        external_symbol="APTUSDT",
+        net_apr_7d_pct=30.0,
+    )
+    _save_cross_perp_run(store, [first, second, third])
+    _save_cross_perp_run(
+        store,
+        [
+            qualifying_observation(observed_at_ms=3_601_000),
+            replace(second, observed_at_ms=3_601_000),
+            replace(third, observed_at_ms=3_601_000),
+        ],
+    )
+    _save_cross_perp_run(
+        store,
+        [
+            qualifying_observation(observed_at_ms=7_201_000),
+            replace(second, observed_at_ms=7_201_000),
+            replace(third, observed_at_ms=7_201_000),
+            non_ready,
+        ],
+    )
+
+    latest = store.latest_cross_perp_observations()
+    assert [item["net_apr_7d_pct"] for item in latest] == [
+        40.0,
+        30.0,
+        qualifying_observation(observed_at_ms=1_000).net_apr_7d_pct,
+        None,
+    ]
+    assert [item["external_symbol"] for item in store.latest_cross_perp_observations(
+        observation_ready_only=True
+    )] == ["ZROUSDC", "ZROUSDT", "ETHUSDT"]
+    assert all(item["observation_age_seconds"] >= 0 for item in latest)
+
+    _save_cross_perp_run(store, [], status="failed")
+    assert store.latest_cross_perp_observations() == []
+
+
+def test_cross_perp_summary_decodes_venue_status_and_rejections(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(
+        store,
+        [
+            replace(
+                qualifying_observation(observed_at_ms=1_000),
+                qualified=False,
+                reasons=("stale_quote", "insufficient_depth"),
+            )
+        ],
+        venue_status={"binance": "success", "okx": "failed"},
+    )
+
+    summary = store.cross_perp_summary()
+
+    assert summary["status"] == "success"
+    assert summary["venue_status"] == {"binance": "success", "okx": "failed"}
+    assert summary["rejection_counts"] == {"insufficient_depth": 1, "stale_quote": 1}
