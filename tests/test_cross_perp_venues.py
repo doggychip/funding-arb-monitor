@@ -85,6 +85,7 @@ def test_binance_market_uses_funding_history_and_executable_depth() -> None:
 
     assert market.current_funding_rate == 0.0001
     assert market.mark_price == 2.0
+    assert market.mark_captured_at_ms == 1_000_000
     assert [point.funding_rate for point in market.funding_events] == [0.0001, -0.0002]
     assert market.quote.executable_buy_price == 2.01
     assert market.quote.executable_sell_price == 1.99
@@ -95,6 +96,7 @@ def test_binance_market_uses_funding_history_and_executable_depth() -> None:
 
 def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
     history_requests: list[dict[str, list[str]]] = []
+    market_data_requests: list[str] = []
     now_ms = int(time.time() * 1000)
     first_timestamp = now_ms - 1_000
     second_timestamp = now_ms - 2_000
@@ -123,8 +125,21 @@ def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
                 }
             if before == str(third_timestamp):
                 return {"data": []}
+        if parsed.path == "/api/v5/public/mark-price":
+            market_data_requests.append(parsed.path)
+            return {
+                "data": [
+                    {
+                        "instId": "ZRO-USDT-SWAP",
+                        "instType": "SWAP",
+                        "markPx": "2.00",
+                        "ts": str(now_ms),
+                    }
+                ]
+            }
         if parsed.path == "/api/v5/market/ticker":
-            return {"data": [{"last": "2.00", "ts": str(now_ms)}]}
+            market_data_requests.append(parsed.path)
+            return {"data": [{"last": "9.99", "ts": str(now_ms)}]}
         if parsed.path == "/api/v5/market/books":
             return {
                 "data": [
@@ -142,6 +157,8 @@ def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
 
     market = venue.market(instrument, days=7, notional_usd=1_000)
 
+    assert market.mark_price == 2.0
+    assert market.mark_captured_at_ms == now_ms
     assert [point.funding_rate for point in market.funding_events] == [0.0001, -0.0002, 0.0003]
     assert market.quote.executable_buy_price == 2.01
     assert market.quote.executable_sell_price == 1.99
@@ -151,6 +168,7 @@ def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
         str(second_timestamp),
         str(third_timestamp),
     ]
+    assert market_data_requests == ["/api/v5/public/mark-price"]
 
 
 def test_market_preserves_visible_depth_when_execution_is_insufficient() -> None:

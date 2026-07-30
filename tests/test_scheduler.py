@@ -1,8 +1,10 @@
 import subprocess
+import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import funding_arb_monitor.scheduler as scheduler
 from funding_arb_monitor.scheduler import ScheduledJob, due_jobs, execute_job
 from funding_arb_monitor.store import Store
 
@@ -16,12 +18,27 @@ def test_hourly_job_runs_once_per_minute() -> None:
 
 
 def test_daily_report_only_runs_at_configured_hour() -> None:
-    assert due_jobs(datetime(2026, 7, 23, 16, 15), {}) == []
-    assert [job.name for job in due_jobs(datetime(2026, 7, 23, 17, 15), {})] == ["report"]
+    assert due_jobs(
+        datetime(2026, 7, 23, 16, 15),
+        {"cross-perp": "2026-07-23T16:06"},
+    ) == []
+    assert [
+        job.name
+        for job in due_jobs(
+            datetime(2026, 7, 23, 17, 15),
+            {"cross-perp": "2026-07-23T17:06"},
+        )
+    ] == ["report"]
 
 
 def test_shadow_paper_job_runs_after_hourly_scan() -> None:
-    assert [job.name for job in due_jobs(datetime(2026, 7, 23, 18, 7), {})] == ["shadow"]
+    assert [
+        job.name
+        for job in due_jobs(
+            datetime(2026, 7, 23, 18, 7),
+            {"cross-perp": "2026-07-23T18:06"},
+        )
+    ] == ["shadow"]
 
 
 def test_cross_perp_runs_after_hourly_scan() -> None:
@@ -31,8 +48,168 @@ def test_cross_perp_runs_after_hourly_scan() -> None:
     assert jobs[0].command == ("cross-perp",)
 
 
+def test_successful_cross_perp_from_previous_hour_gets_current_hour_catch_up() -> None:
+    slots = {"cross-perp": "2026-07-30T17:06"}
+
+    jobs = due_jobs(datetime(2026, 7, 30, 18, 8), slots)
+
+    assert [job.name for job in jobs] == ["cross-perp"]
+    assert slots["cross-perp"] == "2026-07-30T18:06"
+    assert due_jobs(datetime(2026, 7, 30, 18, 9), slots) == []
+
+
+def test_scan_crossing_six_and_long_cross_perp_dispatch_each_paper_job_once(
+    tmp_path, monkeypatch
+) -> None:
+    class Clock:
+        current = datetime(2026, 7, 30, 18, 5)
+
+        @classmethod
+        def now(cls, timezone=None):
+            return cls.current
+
+    class FastStop:
+        def __init__(self) -> None:
+            self.event = threading.Event()
+
+        def is_set(self) -> bool:
+            return self.event.is_set()
+
+        def set(self) -> None:
+            self.event.set()
+
+        def wait(self, timeout: float) -> bool:
+            return self.event.wait(0.002)
+
+    stop = FastStop()
+    release_cross_perp = threading.Event()
+    cross_perp_started = threading.Event()
+    cross_perp_finished = threading.Event()
+    paper_started = {
+        name: threading.Event() for name in ("shadow", "accrue", "update")
+    }
+    calls: list[str] = []
+
+    def fake_execute(job, database_path, store):
+        calls.append(job.name)
+        if job.name == "scan":
+            Clock.current = datetime(2026, 7, 30, 18, 6)
+        elif job.name == "cross-perp":
+            cross_perp_started.set()
+            release_cross_perp.wait(2)
+            cross_perp_finished.set()
+        elif job.name in paper_started:
+            paper_started[job.name].set()
+        return 0
+
+    observations: dict[str, bool] = {}
+
+    def advance_clock() -> None:
+        cross_perp_started.wait(1)
+        for minute, job_name in ((7, "shadow"), (10, "accrue"), (12, "update")):
+            Clock.current = datetime(2026, 7, 30, 18, minute)
+            observations[job_name] = paper_started[job_name].wait(0.2)
+        release_cross_perp.set()
+        cross_perp_finished.wait(1)
+        stop.set()
+
+    monkeypatch.setattr(scheduler, "datetime", Clock)
+    monkeypatch.setattr(scheduler, "execute_job", fake_execute)
+    driver = threading.Thread(target=advance_clock)
+    driver.start()
+
+    scheduler.run_scheduler(stop, str(tmp_path / "test.db"))
+    driver.join()
+
+    assert observations == {"shadow": True, "accrue": True, "update": True}
+    assert calls.count("scan") == 1
+    assert calls.count("cross-perp") == 1
+    assert calls.count("shadow") == 1
+    assert calls.count("accrue") == 1
+    assert calls.count("update") == 1
+
+
+def test_scheduler_prevents_overlapping_cross_perp_runs(
+    tmp_path, monkeypatch
+) -> None:
+    class Clock:
+        current = datetime(2026, 7, 30, 18, 6)
+
+        @classmethod
+        def now(cls, timezone=None):
+            return cls.current
+
+    class FastStop:
+        def __init__(self) -> None:
+            self.event = threading.Event()
+
+        def is_set(self) -> bool:
+            return self.event.is_set()
+
+        def set(self) -> None:
+            self.event.set()
+
+        def wait(self, timeout: float) -> bool:
+            return self.event.wait(0.002)
+
+    stop = FastStop()
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = 0
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_execute(job, database_path, store):
+        nonlocal calls, active, max_active
+        with lock:
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            if calls == 1:
+                first_started.set()
+            else:
+                second_started.set()
+        release.wait(2)
+        with lock:
+            active -= 1
+            if active == 0:
+                finished.set()
+        return 0
+
+    overlap_observed = {"value": False}
+
+    def advance_clock() -> None:
+        first_started.wait(1)
+        Clock.current = datetime(2026, 7, 30, 19, 6)
+        overlap_observed["value"] = second_started.wait(0.1)
+        release.set()
+        finished.wait(1)
+        stop.set()
+
+    monkeypatch.setattr(scheduler, "datetime", Clock)
+    monkeypatch.setattr(scheduler, "execute_job", fake_execute)
+    driver = threading.Thread(target=advance_clock)
+    driver.start()
+
+    scheduler.run_scheduler(stop, str(tmp_path / "test.db"))
+    driver.join()
+
+    assert overlap_observed["value"] is False
+    assert calls == 1
+    assert max_active == 1
+
+
 def test_daily_heartbeat_follows_report() -> None:
-    assert [job.name for job in due_jobs(datetime(2026, 7, 23, 17, 16), {})] == [
+    assert [
+        job.name
+        for job in due_jobs(
+            datetime(2026, 7, 23, 17, 16),
+            {"cross-perp": "2026-07-23T17:06"},
+        )
+    ] == [
         "heartbeat"
     ]
 

@@ -4,6 +4,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from statistics import median
+from threading import Lock
 from typing import Callable
 
 from funding_arb_monitor.cross_perp_venues import (
@@ -27,6 +28,7 @@ class CrossPerpConfig:
     min_history_coverage: float = 0.8
     max_basis_bps: float = 100.0
     max_quote_age_ms: int = 60_000
+    max_mark_age_ms: int = 60_000
     continuity_window_ms: int = 90 * 60_000
     hyperliquid_fee_bps: float = 4.5
 
@@ -37,6 +39,7 @@ class HyperliquidPerpMarket:
     asset: str
     current_funding_rate: float
     mark_price: float
+    mark_captured_at_ms: int
     funding_captured_at_ms: int
     funding_events: tuple[PerpFundingEvent, ...]
     quote: PerpBookQuote
@@ -61,6 +64,8 @@ class CrossPerpObservation:
     basis_bps: float | None
     hyperliquid_mark_price: float | None
     external_mark_price: float | None
+    hyperliquid_mark_at_ms: int | None
+    external_mark_at_ms: int | None
     hyperliquid_executable_price: float | None
     external_executable_price: float | None
     hyperliquid_slippage_bps: float | None
@@ -110,6 +115,11 @@ class CrossPerpMonitor:
         except Exception as exc:
             self._finish_failed(run_id, venue_status, str(exc))
             raise RuntimeError("Hyperliquid market data unavailable") from exc
+        if not snapshots:
+            self._finish_failed(
+                run_id, venue_status, "empty Hyperliquid market catalogue"
+            )
+            raise RuntimeError("Hyperliquid market data unavailable")
 
         catalogues: list[tuple[ExternalPerpVenue, dict[str, PerpInstrument]]] = []
         for venue in self.venues:
@@ -128,53 +138,19 @@ class CrossPerpMonitor:
             raise RuntimeError("no external perpetual catalogues available")
 
         hyperliquid_markets: dict[tuple[str, str], HyperliquidPerpMarket] = {}
-        external_jobs: list[
-            tuple[
-                MarketSnapshot,
-                PerpInstrument,
-                HyperliquidPerpMarket,
-                Future[ExternalPerpMarket],
-            ]
-        ] = []
-        match_count = 0
-        executor = ThreadPoolExecutor(max_workers=8)
-        try:
-            for venue, instruments in catalogues:
-                for snapshot in snapshots:
-                    instrument = instruments.get(snapshot.coin)
-                    if instrument is None:
-                        continue
-                    match_count += 1
-                    market_key = (snapshot.dex, snapshot.coin)
-                    hyperliquid_market = hyperliquid_markets.get(market_key)
-                    if hyperliquid_market is None:
-                        try:
-                            hyperliquid_market = self._hyperliquid_market(snapshot)
-                        except Exception as exc:
-                            self._finish_failed(run_id, venue_status, str(exc))
-                            raise RuntimeError(
-                                "Hyperliquid market data unavailable"
-                            ) from exc
-                        hyperliquid_markets[market_key] = hyperliquid_market
-                    future = executor.submit(
-                        venue.market,
-                        instrument,
-                        days=self.config.history_days,
-                        notional_usd=self.config.notional_usd,
-                    )
-                    external_jobs.append(
-                        (snapshot, instrument, hyperliquid_market, future)
-                    )
-        except Exception:
-            executor.shutdown(wait=True, cancel_futures=True)
-            raise
-        executor.shutdown(wait=True)
+        observation_batches: list[list[CrossPerpObservation] | None] = []
+        observation_lock = Lock()
 
-        observations: list[CrossPerpObservation] = []
-        for snapshot, instrument, hyperliquid_market, future in external_jobs:
+        def consume_external_market(
+            future: Future[ExternalPerpMarket],
+            job_index: int,
+            snapshot: MarketSnapshot,
+            instrument: PerpInstrument,
+            hyperliquid_market: HyperliquidPerpMarket,
+        ) -> None:
             try:
                 external_market = future.result()
-                observations.extend(
+                batch = [
                     evaluate_direction(
                         hyperliquid_market,
                         external_market,
@@ -186,9 +162,9 @@ class CrossPerpMonitor:
                         "short_hyperliquid_long_external",
                         "long_hyperliquid_short_external",
                     )
-                )
+                ]
             except Exception:
-                observations.extend(
+                batch = [
                     self._venue_unavailable_observation(
                         snapshot, instrument, direction, hyperliquid_market
                     )
@@ -196,7 +172,66 @@ class CrossPerpMonitor:
                         "short_hyperliquid_long_external",
                         "long_hyperliquid_short_external",
                     )
-                )
+                ]
+            with observation_lock:
+                observation_batches[job_index] = batch
+
+        match_count = 0
+        executor = ThreadPoolExecutor(max_workers=8)
+        try:
+            for snapshot in snapshots:
+                matched_routes = [
+                    (venue, instruments[snapshot.coin])
+                    for venue, instruments in catalogues
+                    if snapshot.coin in instruments
+                ]
+                if not matched_routes:
+                    continue
+                market_key = (snapshot.dex, snapshot.coin)
+                hyperliquid_market = hyperliquid_markets.get(market_key)
+                if hyperliquid_market is None:
+                    try:
+                        hyperliquid_market = self._hyperliquid_market(snapshot)
+                    except Exception as exc:
+                        self._finish_failed(run_id, venue_status, str(exc))
+                        raise RuntimeError(
+                            "Hyperliquid market data unavailable"
+                        ) from exc
+                    hyperliquid_markets[market_key] = hyperliquid_market
+                for venue, instrument in matched_routes:
+                    match_count += 1
+                    future = executor.submit(
+                        venue.market,
+                        instrument,
+                        days=self.config.history_days,
+                        notional_usd=self.config.notional_usd,
+                    )
+                    job_index = len(observation_batches)
+                    observation_batches.append(None)
+                    future.add_done_callback(
+                        lambda completed,
+                        index=job_index,
+                        route_snapshot=snapshot,
+                        route_instrument=instrument,
+                        route_hyperliquid=hyperliquid_market: consume_external_market(
+                            completed,
+                            index,
+                            route_snapshot,
+                            route_instrument,
+                            route_hyperliquid,
+                        )
+                    )
+        except Exception:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        executor.shutdown(wait=True)
+
+        observations = [
+            observation
+            for batch in observation_batches
+            if batch is not None
+            for observation in batch
+        ]
 
         saved = self.store.save_cross_perp_observations(
             run_id,
@@ -235,7 +270,10 @@ class CrossPerpMonitor:
         history = self.hyperliquid.funding_history(
             snapshot.coin, self.config.history_days
         )
-        quote = self.hyperliquid.perp_quote(
+        quote_reader = getattr(self.hyperliquid, "perp_book_quote", None)
+        if quote_reader is None:
+            quote_reader = self.hyperliquid.perp_quote
+        quote = quote_reader(
             snapshot.coin, snapshot.dex, self.config.notional_usd
         )
         if quote is None:
@@ -245,6 +283,7 @@ class CrossPerpMonitor:
             asset=snapshot.coin,
             current_funding_rate=snapshot.funding_rate,
             mark_price=snapshot.mark_price,
+            mark_captured_at_ms=int(snapshot.captured_at.timestamp() * 1_000),
             funding_captured_at_ms=int(snapshot.captured_at.timestamp() * 1_000),
             funding_events=tuple(
                 PerpFundingEvent(event.timestamp_ms, event.funding_rate)
@@ -278,6 +317,8 @@ class CrossPerpMonitor:
             basis_bps=None,
             hyperliquid_mark_price=hyperliquid_market.mark_price,
             external_mark_price=None,
+            hyperliquid_mark_at_ms=hyperliquid_market.mark_captured_at_ms,
+            external_mark_at_ms=None,
             hyperliquid_executable_price=None,
             external_executable_price=None,
             hyperliquid_slippage_bps=None,
@@ -379,9 +420,9 @@ def evaluate_direction(
         )
 
     hyperliquid_slippage_bps = _slippage_bps(
-        hyperliquid_price, hyperliquid.mark_price
+        hyperliquid_price, hyperliquid.quote.mid
     )
-    external_slippage_bps = _slippage_bps(external_price, external.mark_price)
+    external_slippage_bps = _slippage_bps(external_price, external.quote.mid)
     if hyperliquid_slippage_bps is None or external_slippage_bps is None:
         transaction_cost_usd = None
         net_apr_7d_pct = None
@@ -411,6 +452,8 @@ def evaluate_direction(
         external_latest_funding_at_ms=_latest_funding_at(external.funding_events),
         hyperliquid_interval_ms=hyperliquid_interval_ms,
         external_interval_ms=external_interval_ms,
+        hyperliquid_mark_at_ms=hyperliquid.mark_captured_at_ms,
+        external_mark_at_ms=external.mark_captured_at_ms,
         hyperliquid_quote_at_ms=hyperliquid.quote.captured_at_ms,
         external_quote_at_ms=external.quote.captured_at_ms,
         hyperliquid_price=hyperliquid_price,
@@ -440,6 +483,8 @@ def evaluate_direction(
         basis_bps=basis_bps,
         hyperliquid_mark_price=hyperliquid.mark_price,
         external_mark_price=external.mark_price,
+        hyperliquid_mark_at_ms=hyperliquid.mark_captured_at_ms,
+        external_mark_at_ms=external.mark_captured_at_ms,
         hyperliquid_executable_price=hyperliquid_price,
         external_executable_price=external_price,
         hyperliquid_slippage_bps=hyperliquid_slippage_bps,
@@ -459,10 +504,12 @@ def evaluate_direction(
     )
 
 
-def _slippage_bps(executable_price: float | None, mark_price: float) -> float | None:
+def _slippage_bps(
+    executable_price: float | None, book_midpoint: float
+) -> float | None:
     if executable_price is None:
         return None
-    return abs(executable_price / mark_price - 1) * 10_000
+    return abs(executable_price / book_midpoint - 1) * 10_000
 
 
 def _latest_funding_at(events: tuple[PerpFundingEvent, ...]) -> int | None:
@@ -477,6 +524,8 @@ def _qualification_reasons(
     external_latest_funding_at_ms: int | None,
     hyperliquid_interval_ms: int | None,
     external_interval_ms: int | None,
+    hyperliquid_mark_at_ms: int,
+    external_mark_at_ms: int,
     hyperliquid_quote_at_ms: int,
     external_quote_at_ms: int,
     hyperliquid_price: float | None,
@@ -498,6 +547,11 @@ def _qualification_reasons(
         hyperliquid_latest_funding_at_ms, hyperliquid_interval_ms, now_ms
     ) or _is_stale_funding(external_latest_funding_at_ms, external_interval_ms, now_ms):
         reasons.append("stale_funding")
+    if (
+        now_ms - hyperliquid_mark_at_ms > config.max_mark_age_ms
+        or now_ms - external_mark_at_ms > config.max_mark_age_ms
+    ):
+        reasons.append("stale_mark")
     if (
         now_ms - hyperliquid_quote_at_ms > config.max_quote_age_ms
         or now_ms - external_quote_at_ms > config.max_quote_age_ms

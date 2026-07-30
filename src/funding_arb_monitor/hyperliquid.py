@@ -152,6 +152,17 @@ class HyperliquidClient:
     def perp_quote(
         self, coin: str, dex: str, notional_usd: float
     ) -> PerpQuote | None:
+        quote = self.perp_book_quote(coin, dex, notional_usd)
+        if (
+            quote.executable_sell_price is None
+            or quote.executable_buy_price is None
+        ):
+            return None
+        return quote
+
+    def perp_book_quote(
+        self, coin: str, dex: str, notional_usd: float
+    ) -> PerpQuote:
         payload: dict[str, object] = {"type": "l2Book", "coin": coin}
         if dex != "(main)":
             payload["dex"] = dex
@@ -166,8 +177,6 @@ class HyperliquidClient:
             captured_at_ms = int(data["time"])
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise RuntimeError("invalid Hyperliquid order book response") from exc
-        if sell_price is None or buy_price is None:
-            return None
         return PerpQuote(
             coin=coin,
             dex=dex,

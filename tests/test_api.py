@@ -74,7 +74,7 @@ def test_cross_perp_api_empty_state(tmp_path) -> None:
     assert client.get("/api/cross-perp/opportunities").json() == []
 
 
-def test_cross_perp_summary_uses_the_newest_successful_run(tmp_path) -> None:
+def test_cross_perp_summary_uses_the_newest_run_rejections_only(tmp_path) -> None:
     db_path = str(tmp_path / "test.db")
     store = Store(db_path)
     store.initialize()
@@ -107,7 +107,7 @@ def test_cross_perp_summary_uses_the_newest_successful_run(tmp_path) -> None:
     summary = client.get("/api/cross-perp/summary").json()
 
     assert summary["status"] == "failed"
-    assert summary["rejection_counts"] == {"stale_quote": 1}
+    assert summary["rejection_counts"] == {}
 
 
 def test_cross_perp_opportunities_are_ranked_and_can_require_ready_streaks(
@@ -252,6 +252,8 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert 'id="funnel-steps"' in dashboard.text
     assert 'id="cross-perp-status"' in dashboard.text
     assert 'id="cross-perp-counters"' in dashboard.text
+    assert 'id="cross-perp-run-age"' in dashboard.text
+    assert "Latest run age" in dashboard.text
     assert 'id="cross-perp-rows"' in dashboard.text
     assert 'id="cross-perp-empty"' in dashboard.text
     assert "Observation ready" in dashboard.text

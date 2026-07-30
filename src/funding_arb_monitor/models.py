@@ -35,8 +35,8 @@ class PerpQuote:
     dex: str
     bid: float
     ask: float
-    executable_sell_price: float
-    executable_buy_price: float
+    executable_sell_price: float | None
+    executable_buy_price: float | None
     bid_depth_usd: float
     ask_depth_usd: float
     captured_at_ms: int

@@ -87,6 +87,7 @@ def _markets() -> tuple[HyperliquidPerpMarket, ExternalPerpMarket]:
         asset="ZRO",
         current_funding_rate=0.0001,
         mark_price=100.0,
+        mark_captured_at_ms=NOW_MS - 1_000,
         funding_captured_at_ms=NOW_MS - 1_000,
         funding_events=_funding_events(30.0),
         quote=_quote(
@@ -99,6 +100,7 @@ def _markets() -> tuple[HyperliquidPerpMarket, ExternalPerpMarket]:
         instrument=PerpInstrument("binance", "ZRO", "ZROUSDT"),
         current_funding_rate=0.0001,
         mark_price=100.0,
+        mark_captured_at_ms=NOW_MS - 1_000,
         funding_captured_at_ms=NOW_MS - 1_000,
         funding_events=_funding_events(10.0),
         quote=_quote(
@@ -150,6 +152,26 @@ def test_evaluate_direction_calculates_both_executable_carry_routes() -> None:
     )
     assert short_hl.net_apr_7d_pct < short_hl.gross_spread_apr_pct
     assert long_hl.reasons == ("net_carry_non_positive",)
+
+
+def test_evaluate_direction_measures_slippage_from_each_book_midpoint() -> None:
+    hyperliquid, external = _markets()
+    hyperliquid = replace(hyperliquid, mark_price=99.5)
+
+    observation = evaluate_direction(
+        hyperliquid,
+        external,
+        "short_hyperliquid_long_external",
+        CrossPerpConfig(),
+        NOW_MS,
+    )
+
+    assert observation.hyperliquid_slippage_bps == pytest.approx(5.0)
+    assert observation.external_slippage_bps == pytest.approx(4.0)
+    assert observation.basis_bps == pytest.approx(100.0 / 99.5 * 10_000 - 10_000)
+    assert observation.transaction_cost_usd == pytest.approx(
+        1_000 * (2 * (4.5 + 5.0 + 5.0 + 4.0)) / 10_000
+    )
 
 
 def test_evaluate_direction_rejects_insufficient_history() -> None:
@@ -205,6 +227,31 @@ def test_evaluate_direction_rejects_stale_quote() -> None:
     assert observation.reasons == ("stale_quote",)
 
 
+def test_evaluate_direction_retains_and_rejects_stale_mark_timestamps() -> None:
+    hyperliquid, external = _markets()
+    hyperliquid_mark_at_ms = NOW_MS - 1_000
+    stale_mark_at_ms = NOW_MS - 60_001
+    hyperliquid = replace(
+        hyperliquid, mark_captured_at_ms=hyperliquid_mark_at_ms
+    )
+    external = replace(external, mark_captured_at_ms=stale_mark_at_ms)
+
+    observation = evaluate_direction(
+        hyperliquid,
+        external,
+        "short_hyperliquid_long_external",
+        CrossPerpConfig(),
+        NOW_MS,
+    )
+
+    assert (
+        getattr(observation, "hyperliquid_mark_at_ms", None)
+        == hyperliquid_mark_at_ms
+    )
+    assert getattr(observation, "external_mark_at_ms", None) == stale_mark_at_ms
+    assert observation.reasons == ("stale_mark",)
+
+
 def test_evaluate_direction_rejects_missing_required_book_side() -> None:
     hyperliquid, external = _markets()
     external = replace(
@@ -233,6 +280,8 @@ def test_evaluate_direction_rejects_wide_basis() -> None:
         mark_price=101.01,
         quote=replace(
             external.quote,
+            bid=101.00,
+            ask=101.02,
             executable_buy_price=101.050404,
             executable_sell_price=100.969596,
         ),
@@ -485,6 +534,85 @@ def test_latest_cross_perp_observations_rank_ready_routes_and_hide_stale_runs(tm
     assert store.latest_cross_perp_observations() == []
 
 
+def test_running_cross_perp_run_hides_previous_success(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(
+        store, [qualifying_observation(observed_at_ms=NOW_MS - 1)]
+    )
+
+    running_run_id = store.start_cross_perp_run()
+
+    summary = store.cross_perp_summary()
+    assert summary["id"] == running_run_id
+    assert summary["status"] == "running"
+    assert summary["rejection_counts"] == {}
+    assert store.latest_cross_perp_observations() == []
+
+
+def test_failed_cross_perp_run_with_rows_hides_opportunities(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _save_cross_perp_run(
+        store,
+        [qualifying_observation(observed_at_ms=NOW_MS - 1)],
+        status="failed",
+    )
+
+    assert store.cross_perp_summary()["status"] == "failed"
+    assert store.latest_cross_perp_observations() == []
+
+
+def test_starting_cross_perp_run_fails_abandoned_running_run(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    abandoned_run_id = store.start_cross_perp_run()
+
+    current_run_id = store.start_cross_perp_run()
+
+    with store.connect() as connection:
+        abandoned = dict(
+            connection.execute(
+                "SELECT * FROM cross_perp_runs WHERE id = ?",
+                (abandoned_run_id,),
+            ).fetchone()
+        )
+    assert abandoned["status"] == "failed"
+    assert abandoned["completed_at_ms"] is not None
+    assert abandoned["error"] == "abandoned by newer cross-perp run"
+    assert store.cross_perp_summary()["id"] == current_run_id
+    assert store.cross_perp_summary()["status"] == "running"
+
+
+def test_cross_perp_opportunities_recover_after_later_success(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    failed_run_id = store.start_cross_perp_run()
+    store.save_cross_perp_observations(
+        failed_run_id,
+        [qualifying_observation(observed_at_ms=NOW_MS - 1)],
+        continuity_window_ms=5_400_000,
+    )
+    store.finish_cross_perp_run(
+        failed_run_id,
+        status="failed",
+        venue_status={"binance": "failed"},
+        match_count=1,
+        evaluation_count=1,
+        positive_net_count=0,
+        ready_count=0,
+    )
+
+    _save_cross_perp_run(
+        store, [qualifying_observation(observed_at_ms=NOW_MS + 3_600_000)]
+    )
+
+    assert store.cross_perp_summary()["status"] == "success"
+    assert [row["asset"] for row in store.latest_cross_perp_observations()] == [
+        "ZRO"
+    ]
+
+
 def test_cross_perp_summary_decodes_venue_status_and_rejections(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
@@ -547,6 +675,11 @@ class FakeHyperliquid:
             captured_at_ms=NOW_MS - 1_000,
         )
 
+    def perp_book_quote(
+        self, coin: str, dex: str, notional_usd: float
+    ) -> PerpQuote:
+        return self.perp_quote(coin, dex, notional_usd)
+
 
 class FakeExternalVenue:
     def __init__(
@@ -581,6 +714,7 @@ class FakeExternalVenue:
             instrument=instrument,
             current_funding_rate=0.0001,
             mark_price=100.0,
+            mark_captured_at_ms=NOW_MS - 1_000,
             funding_captured_at_ms=NOW_MS - 1_000,
             funding_events=_funding_events(10.0),
             quote=_quote(
@@ -649,6 +783,24 @@ def test_monitor_persists_successful_venue_when_another_catalogue_fails(tmp_path
     assert hyperliquid.quote_calls == [("ZRO", "(main)")]
 
 
+def test_monitor_fails_when_hyperliquid_catalogue_is_empty(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+
+    with pytest.raises(RuntimeError, match="Hyperliquid market data unavailable"):
+        CrossPerpMonitor(
+            hyperliquid=FakeHyperliquid(()),
+            venues=[FakeExternalVenue("binance", ("ZRO",))],
+            store=store,
+            now_ms=lambda: NOW_MS,
+        ).run()
+
+    summary = store.cross_perp_summary()
+    assert summary["status"] == "failed"
+    assert summary["error"] == "empty Hyperliquid market catalogue"
+    assert store.latest_cross_perp_observations() == []
+
+
 def test_monitor_fails_when_all_external_catalogues_fail_without_copying_stale_rows(
     tmp_path,
 ) -> None:
@@ -715,6 +867,48 @@ def test_monitor_fails_when_hyperliquid_order_book_is_unavailable(tmp_path) -> N
     assert store.latest_cross_perp_observations() == []
 
 
+def test_monitor_keeps_partial_hyperliquid_depth_per_direction(tmp_path) -> None:
+    class PartialBookHyperliquid(FakeHyperliquid):
+        def perp_quote(
+            self, coin: str, dex: str, notional_usd: float
+        ) -> PerpQuote | None:
+            return None
+
+        def perp_book_quote(
+            self, coin: str, dex: str, notional_usd: float
+        ) -> PerpQuote:
+            assert notional_usd == 1_000.0
+            return PerpQuote(
+                coin=coin,
+                dex=dex,
+                bid=99.99,
+                ask=100.01,
+                executable_sell_price=99.95,
+                executable_buy_price=None,
+                bid_depth_usd=2_000.0,
+                ask_depth_usd=200.0,
+                captured_at_ms=NOW_MS - 1_000,
+            )
+
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+
+    result = CrossPerpMonitor(
+        hyperliquid=PartialBookHyperliquid(),
+        venues=[FakeExternalVenue("binance", ("ZRO",))],
+        store=store,
+        now_ms=lambda: NOW_MS,
+    ).run()
+
+    rows = {
+        row["direction"]: row for row in store.latest_cross_perp_observations()
+    }
+    assert result["status"] == "success"
+    assert rows["short_hyperliquid_long_external"]["qualified"] is True
+    assert "insufficient_depth" in rows["long_hyperliquid_short_external"]["reasons"]
+    assert rows["long_hyperliquid_short_external"]["hyperliquid_depth_usd"] == 200.0
+
+
 def test_monitor_persists_market_failures_and_continues_other_assets(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
@@ -762,6 +956,83 @@ def test_monitor_bounds_concurrent_external_markets_without_changing_routes(
     assert result["match_count"] == len(assets)
     assert result["evaluation_count"] == 2 * len(assets)
     assert len(store.latest_cross_perp_observations()) == 2 * len(assets)
+
+
+def test_monitor_evaluates_early_external_routes_during_hyperliquid_acquisition(
+    tmp_path,
+) -> None:
+    clock = {"now_ms": NOW_MS}
+    early_routes_evaluated = threading.Event()
+    evaluation_count = 0
+    evaluation_lock = threading.Lock()
+
+    def now_ms() -> int:
+        nonlocal evaluation_count
+        with evaluation_lock:
+            evaluation_count += 1
+            if evaluation_count >= 4:
+                early_routes_evaluated.set()
+        return clock["now_ms"]
+
+    class ClockedHyperliquid(FakeHyperliquid):
+        def __init__(self) -> None:
+            super().__init__(("EARLY", "LATE"))
+            self.early_evaluated_before_late = False
+
+        def funding_history(self, coin: str, days: int):
+            if coin == "LATE":
+                self.early_evaluated_before_late = early_routes_evaluated.wait(0.2)
+                clock["now_ms"] = NOW_MS + 120_000
+            return super().funding_history(coin, days)
+
+    class ClockedVenue(FakeExternalVenue):
+        def market(
+            self, instrument: PerpInstrument, *, days: int, notional_usd: float
+        ) -> ExternalPerpMarket:
+            market = super().market(
+                instrument, days=days, notional_usd=notional_usd
+            )
+            return replace(
+                market,
+                mark_captured_at_ms=clock["now_ms"] - 1_000,
+                quote=replace(
+                    market.quote, captured_at_ms=clock["now_ms"] - 1_000
+                ),
+            )
+
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    hyperliquid = ClockedHyperliquid()
+
+    CrossPerpMonitor(
+        hyperliquid=hyperliquid,
+        venues=[
+            ClockedVenue("binance", ("EARLY", "LATE")),
+            ClockedVenue("okx", ("EARLY", "LATE")),
+        ],
+        store=store,
+        now_ms=now_ms,
+    ).run()
+
+    rows = store.latest_cross_perp_observations()
+    early_rows = [row for row in rows if row["asset"] == "EARLY"]
+    assert hyperliquid.early_evaluated_before_late is True
+    assert all("stale_quote" not in row["reasons"] for row in early_rows)
+    assert max(row["observed_at_ms"] for row in early_rows) < max(
+        row["observed_at_ms"] for row in rows if row["asset"] == "LATE"
+    )
+    assert [
+        (row["asset"], row["external_venue"], row["direction"]) for row in rows
+    ] == [
+        ("EARLY", "okx", "short_hyperliquid_long_external"),
+        ("LATE", "okx", "short_hyperliquid_long_external"),
+        ("EARLY", "binance", "short_hyperliquid_long_external"),
+        ("LATE", "binance", "short_hyperliquid_long_external"),
+        ("EARLY", "okx", "long_hyperliquid_short_external"),
+        ("LATE", "okx", "long_hyperliquid_short_external"),
+        ("EARLY", "binance", "long_hyperliquid_short_external"),
+        ("LATE", "binance", "long_hyperliquid_short_external"),
+    ]
 
 
 def test_monitor_cancels_pending_external_markets_on_hyperliquid_failure(

@@ -117,3 +117,24 @@ def test_perp_quote_returns_none_when_either_side_cannot_fill_notional() -> None
         quote = client.perp_quote("TEST", "(main)", 1_000)
 
     assert quote is None
+
+
+def test_perp_book_quote_preserves_partial_depth_for_cross_perp() -> None:
+    client = HyperliquidClient()
+    book = {
+        "time": 1,
+        "levels": [
+            [{"px": "99", "sz": "20", "n": 1}],
+            [{"px": "101", "sz": "2", "n": 1}],
+        ],
+    }
+    partial_quote = getattr(client, "perp_book_quote", None)
+    assert partial_quote is not None, "cross-perp partial-book reader is missing"
+
+    with patch.object(client, "post", return_value=book):
+        quote = partial_quote("TEST", "(main)", 1_000)
+
+    assert quote.executable_sell_price == 99.0
+    assert quote.executable_buy_price is None
+    assert quote.bid_depth_usd == pytest.approx(1_980.0)
+    assert quote.ask_depth_usd == pytest.approx(202.0)

@@ -45,6 +45,7 @@ class ExternalPerpMarket:
     instrument: PerpInstrument
     current_funding_rate: float
     mark_price: float
+    mark_captured_at_ms: int
     funding_captured_at_ms: int
     funding_events: tuple[PerpFundingEvent, ...]
     quote: PerpBookQuote
@@ -190,6 +191,7 @@ class BinancePerpVenue:
                 instrument=instrument,
                 current_funding_rate=float(premium["lastFundingRate"]),
                 mark_price=float(premium["markPrice"]),
+                mark_captured_at_ms=int(premium["time"]),
                 funding_captured_at_ms=int(premium["time"]),
                 funding_events=funding_events,
                 quote=_quote_from_book(
@@ -259,19 +261,27 @@ class OkxPerpVenue:
         instrument_query = urllib.parse.urlencode({"instId": instrument.symbol})
         funding = self.get_json(f"{self.base_url}/public/funding-rate?{instrument_query}")
         history = self._funding_history(instrument.symbol, days)
-        ticker = self.get_json(f"{self.base_url}/market/ticker?{instrument_query}")
+        mark_query = urllib.parse.urlencode(
+            {"instType": "SWAP", "instId": instrument.symbol}
+        )
+        mark = self.get_json(f"{self.base_url}/public/mark-price?{mark_query}")
         book_query = urllib.parse.urlencode({"instId": instrument.symbol, "sz": 400})
         books = self.get_json(f"{self.base_url}/market/books?{book_query}")
         try:
-            if not isinstance(funding, dict) or not isinstance(ticker, dict) or not isinstance(books, dict):
+            if (
+                not isinstance(funding, dict)
+                or not isinstance(mark, dict)
+                or not isinstance(books, dict)
+            ):
                 raise TypeError
             funding_row = funding["data"][0]
-            ticker_row = ticker["data"][0]
+            mark_row = mark["data"][0]
             book = books["data"][0]
             return ExternalPerpMarket(
                 instrument=instrument,
                 current_funding_rate=float(funding_row["fundingRate"]),
-                mark_price=float(ticker_row["last"]),
+                mark_price=float(mark_row["markPx"]),
+                mark_captured_at_ms=int(mark_row["ts"]),
                 funding_captured_at_ms=int(funding_row["fundingTime"]),
                 funding_events=history,
                 quote=_quote_from_book(

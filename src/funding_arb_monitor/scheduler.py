@@ -34,10 +34,16 @@ JOBS = (
 
 def due_jobs(now: datetime, last_slots: dict[str, str]) -> list[ScheduledJob]:
     due: list[ScheduledJob] = []
-    slot = now.strftime("%Y-%m-%dT%H:%M")
     for job in JOBS:
-        if now.minute != job.minute or (job.hour is not None and now.hour != job.hour):
+        catch_up = job.name == "cross-perp" and now.minute >= job.minute
+        if (
+            (now.minute != job.minute and not catch_up)
+            or (job.hour is not None and now.hour != job.hour)
+        ):
             continue
+        slot = now.replace(
+            minute=job.minute, second=0, microsecond=0
+        ).strftime("%Y-%m-%dT%H:%M")
         if last_slots.get(job.name) == slot:
             continue
         last_slots[job.name] = slot
@@ -54,8 +60,11 @@ def execute_job(job: ScheduledJob, database_path: str, store: Store) -> int:
         database_path,
         *job.command,
     ]
+    scheduled_at = datetime.now().astimezone().replace(
+        minute=job.minute, second=0, microsecond=0
+    )
     job_run_id = store.start_scheduled_job(
-        job.name, datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M")
+        job.name, scheduled_at.strftime("%Y-%m-%dT%H:%M")
     )
     print(f"scheduler: starting {job.name}", flush=True)
     try:
@@ -105,8 +114,31 @@ def run_scheduler(stop: threading.Event, database_path: str) -> None:
         print(f"scheduler: unknown timezone {timezone_name}; using UTC", flush=True)
         timezone = ZoneInfo("UTC")
     last_slots: dict[str, str] = {}
+    background_jobs: dict[str, threading.Thread] = {}
     print(f"scheduler: started timezone={timezone.key}", flush=True)
     while not stop.is_set():
+        for name, thread in list(background_jobs.items()):
+            if not thread.is_alive():
+                del background_jobs[name]
+        previous_slots = dict(last_slots)
         for job in due_jobs(datetime.now(timezone), last_slots):
+            if job.name == "cross-perp":
+                active = background_jobs.get(job.name)
+                if active is not None and active.is_alive():
+                    previous_slot = previous_slots.get(job.name)
+                    if previous_slot is None:
+                        last_slots.pop(job.name, None)
+                    else:
+                        last_slots[job.name] = previous_slot
+                    continue
+                thread = threading.Thread(
+                    target=execute_job,
+                    args=(job, database_path, store),
+                    name="cross-perp-scheduler",
+                    daemon=True,
+                )
+                background_jobs[job.name] = thread
+                thread.start()
+                continue
             execute_job(job, database_path, store)
         stop.wait(5)

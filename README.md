@@ -182,6 +182,7 @@ Hourly host cron (times are local):
 
 ```cron
 5 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor scan --days 30 --min-oi 1000000 >> data/scanner.log 2>&1
+6 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor cross-perp >> data/cross-perp.log 2>&1
 7 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper shadow >> data/scanner.log 2>&1
 10 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper accrue >> data/scanner.log 2>&1
 12 * * * * cd /path/to/funding-arb-monitor && /path/to/.venv/bin/funding-arb-monitor paper update >> data/scanner.log 2>&1

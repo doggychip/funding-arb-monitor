@@ -112,6 +112,7 @@
         <div class="stat"><div class="value positive" id="cross-perp-positive">—</div><div class="label">Positive after costs</div></div>
         <div class="stat"><div class="value" id="cross-perp-ready">—</div><div class="label">Observation ready</div></div>
         <div class="stat"><div class="value" id="cross-perp-coverage">—</div><div class="label">Venue coverage</div></div>
+        <div class="stat"><div class="value" id="cross-perp-run-age">—</div><div class="label">Latest run age</div></div>
       </div>
       <div class="panel">
         <div class="table-wrap">
@@ -416,6 +417,10 @@
         document.querySelector("#cross-perp-coverage").textContent = venues.length
           ? `${successfulVenues}/${venues.length}`
           : "—";
+        const latestRunAtMs = summary.completed_at_ms ?? summary.started_at_ms;
+        document.querySelector("#cross-perp-run-age").textContent = latestRunAtMs == null
+          ? "—"
+          : analysisAge(new Date(latestRunAtMs).toISOString());
         status.textContent = summary.status === "never_run"
           ? "No completed cross-perpetual run yet."
           : `Latest cross-perpetual run: ${summary.status} · Venue coverage: ${successfulVenues}/${venues.length}`;
@@ -458,6 +463,7 @@
         document.querySelector("#cross-perp-positive").textContent = "—";
         document.querySelector("#cross-perp-ready").textContent = "—";
         document.querySelector("#cross-perp-coverage").textContent = "—";
+        document.querySelector("#cross-perp-run-age").textContent = "—";
         document.querySelector("#cross-perp-rows").innerHTML = "";
         empty.textContent = "Could not load cross-perpetual evidence. Refresh to retry.";
         empty.hidden = false;

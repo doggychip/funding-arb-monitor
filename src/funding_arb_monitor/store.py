@@ -381,10 +381,20 @@ class Store:
         return dict(row) if row else None
 
     def start_cross_perp_run(self) -> int:
+        started_at_ms = int(time.time() * 1000)
         with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE cross_perp_runs
+                SET completed_at_ms = ?, status = 'failed',
+                    error = 'abandoned by newer cross-perp run'
+                WHERE status = 'running'
+                """,
+                (started_at_ms,),
+            )
             cursor = connection.execute(
                 "INSERT INTO cross_perp_runs (started_at_ms, status) VALUES (?, 'running')",
-                (int(time.time() * 1000),),
+                (started_at_ms,),
             )
         return int(cursor.lastrowid)
 
@@ -508,7 +518,6 @@ class Store:
             row = connection.execute(
                 """
                 SELECT * FROM cross_perp_runs
-                WHERE completed_at_ms IS NOT NULL
                 ORDER BY id DESC
                 LIMIT 1
                 """
@@ -529,13 +538,9 @@ class Store:
             observation_rows = connection.execute(
                 """
                 SELECT payload_json FROM cross_perp_observations
-                WHERE run_id = (
-                    SELECT id FROM cross_perp_runs
-                    WHERE status = 'success'
-                    ORDER BY id DESC
-                    LIMIT 1
-                )
-                """
+                WHERE run_id = ?
+                """,
+                (row["id"],),
             ).fetchall()
         rejection_counts: dict[str, int] = {}
         for observation in observation_rows:
@@ -556,12 +561,11 @@ class Store:
                 SELECT * FROM cross_perp_observations
                 WHERE run_id = (
                     SELECT id FROM cross_perp_runs
-                    WHERE completed_at_ms IS NOT NULL
-                    ORDER BY id DESC
-                    LIMIT 1
+                    WHERE status = 'success' AND completed_at_ms IS NOT NULL
+                        AND id = (SELECT MAX(id) FROM cross_perp_runs)
                 )
                 {ready_clause}
-                ORDER BY net_apr_7d_pct IS NULL, net_apr_7d_pct DESC
+                ORDER BY net_apr_7d_pct IS NULL, net_apr_7d_pct DESC, rowid
                 LIMIT ?
                 """,
                 (limit,),
