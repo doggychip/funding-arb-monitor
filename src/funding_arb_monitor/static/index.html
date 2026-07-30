@@ -396,6 +396,7 @@
       const emptyMessage = "No completed cross-perpetual observation yet. Run funding-arb-monitor cross-perp, then refresh this page.";
       status.textContent = "Loading public cross-perpetual evidence…";
       status.setAttribute("aria-busy", "true");
+      empty.hidden = true;
       try {
         const [summaryResponse, opportunitiesResponse] = await Promise.all([
           apiFetch("/api/cross-perp/summary"),

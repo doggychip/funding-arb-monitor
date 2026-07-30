@@ -301,6 +301,18 @@ def test_cross_perp_dashboard_accessibility_and_shared_token_prompt(tmp_path) ->
     assert "await promptForReadToken()" in dashboard.text
 
 
+def test_cross_perp_reload_hides_stale_empty_state_before_fetch(tmp_path) -> None:
+    client = TestClient(create_app(str(tmp_path / "test.db")))
+
+    dashboard = client.get("/")
+    loader = dashboard.text.split("async function loadCrossPerp()", 1)[1]
+    loading_prelude = loader.split("try {", 1)[0]
+
+    assert 'status.textContent = "Loading public cross-perpetual evidence…";' in loading_prelude
+    assert 'status.setAttribute("aria-busy", "true");' in loading_prelude
+    assert "empty.hidden = true;" in loading_prelude
+
+
 def test_approval_token_protects_public_mutation(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FUNDING_ARB_APPROVAL_TOKEN", "secret")
     client = TestClient(create_app(str(tmp_path / "test.db")))
