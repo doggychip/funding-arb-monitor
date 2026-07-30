@@ -527,8 +527,15 @@ class Store:
         result["venue_status"] = json.loads(str(result.pop("venue_status_json")))
         with self.connect() as connection:
             observation_rows = connection.execute(
-                "SELECT payload_json FROM cross_perp_observations WHERE run_id = ?",
-                (result["id"],),
+                """
+                SELECT payload_json FROM cross_perp_observations
+                WHERE run_id = (
+                    SELECT id FROM cross_perp_runs
+                    WHERE status = 'success'
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                """
             ).fetchall()
         rejection_counts: dict[str, int] = {}
         for observation in observation_rows:

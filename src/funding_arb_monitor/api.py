@@ -6,6 +6,7 @@ import time
 from hmac import compare_digest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -13,6 +14,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from .matcher import PaperMatcher
 from .scheduler import run_scheduler
 from .store import Store
+
+
+CrossPerpDirection = Literal[
+    "short_hyperliquid_long_external",
+    "long_hyperliquid_short_external",
+]
 
 
 def create_app(database_path: str | None = None) -> FastAPI:
@@ -142,6 +149,28 @@ def create_app(database_path: str | None = None) -> FastAPI:
         days: int = Query(default=30, ge=1, le=365),
     ) -> dict[str, object]:
         return store.rejection_analytics(days)
+
+    @app.get("/api/cross-perp/summary")
+    def cross_perp_summary() -> dict[str, object]:
+        return store.cross_perp_summary()
+
+    @app.get("/api/cross-perp/opportunities")
+    def cross_perp_opportunities(
+        limit: int = Query(default=100, ge=1, le=500),
+        observation_ready_only: bool = False,
+    ) -> list[dict[str, object]]:
+        return store.latest_cross_perp_observations(
+            limit, observation_ready_only=observation_ready_only
+        )
+
+    @app.get("/api/cross-perp/history")
+    def cross_perp_history(
+        asset: str,
+        external_venue: str,
+        direction: CrossPerpDirection,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, object]]:
+        return store.cross_perp_history(asset, external_venue, direction, limit)
 
     @app.get("/api/status")
     def status() -> dict[str, object]:

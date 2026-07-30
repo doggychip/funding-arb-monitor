@@ -7,6 +7,229 @@ from funding_arb_monitor.models import Candidate, utc_now
 from funding_arb_monitor.store import Store
 
 
+class _CrossPerpObservation:
+    def __init__(
+        self,
+        *,
+        asset: str,
+        external_venue: str,
+        external_symbol: str,
+        direction: str,
+        observed_at_ms: int,
+        net_apr_7d_pct: float,
+        reasons: tuple[str, ...] = (),
+    ) -> None:
+        self.asset = asset
+        self.external_venue = external_venue
+        self.external_symbol = external_symbol
+        self.direction = direction
+        self.observed_at_ms = observed_at_ms
+        self.net_apr_7d_pct = net_apr_7d_pct
+        self.reasons = reasons
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "observed_at_ms": self.observed_at_ms,
+            "hyperliquid_dex": "hyperliquid",
+            "asset": self.asset,
+            "external_venue": self.external_venue,
+            "external_symbol": self.external_symbol,
+            "direction": self.direction,
+            "qualified": True,
+            "net_apr_7d_pct": self.net_apr_7d_pct,
+            "reasons": list(self.reasons),
+        }
+
+
+def _save_cross_perp_api_run(
+    store: Store, observations: list[_CrossPerpObservation]
+) -> None:
+    run_id = store.start_cross_perp_run()
+    saved = store.save_cross_perp_observations(
+        run_id, observations, continuity_window_ms=5_400_000
+    )
+    store.finish_cross_perp_run(
+        run_id,
+        status="success",
+        venue_status={"binance": "success"},
+        match_count=len(observations),
+        evaluation_count=len(observations),
+        positive_net_count=len(observations),
+        ready_count=sum(item["observation_ready"] for item in saved),
+    )
+
+
+def test_cross_perp_api_empty_state(tmp_path) -> None:
+    client = TestClient(create_app(str(tmp_path / "test.db")))
+
+    assert client.get("/api/cross-perp/summary").json() == {
+        "status": "never_run",
+        "venue_status": {},
+        "match_count": 0,
+        "evaluation_count": 0,
+        "positive_net_count": 0,
+        "ready_count": 0,
+        "rejection_counts": {},
+    }
+    assert client.get("/api/cross-perp/opportunities").json() == []
+
+
+def test_cross_perp_summary_uses_the_newest_successful_run(tmp_path) -> None:
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    _save_cross_perp_api_run(
+        store,
+        [
+            _CrossPerpObservation(
+                asset="ZRO",
+                external_venue="binance",
+                external_symbol="ZROUSDT",
+                direction="short_hyperliquid_long_external",
+                observed_at_ms=1_000,
+                net_apr_7d_pct=20.0,
+                reasons=("stale_quote",),
+            )
+        ],
+    )
+    failed_run = store.start_cross_perp_run()
+    store.finish_cross_perp_run(
+        failed_run,
+        status="failed",
+        venue_status={"binance": "failed"},
+        match_count=0,
+        evaluation_count=0,
+        positive_net_count=0,
+        ready_count=0,
+    )
+    client = TestClient(create_app(db_path))
+
+    summary = client.get("/api/cross-perp/summary").json()
+
+    assert summary["status"] == "failed"
+    assert summary["rejection_counts"] == {"stale_quote": 1}
+
+
+def test_cross_perp_opportunities_are_ranked_and_can_require_ready_streaks(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    zro = {
+        "asset": "ZRO",
+        "external_venue": "binance",
+        "external_symbol": "ZROUSDT",
+        "direction": "short_hyperliquid_long_external",
+    }
+    _save_cross_perp_api_run(
+        store,
+        [_CrossPerpObservation(observed_at_ms=1_000, net_apr_7d_pct=20.0, **zro)],
+    )
+    _save_cross_perp_api_run(
+        store,
+        [
+            _CrossPerpObservation(
+                observed_at_ms=3_601_000, net_apr_7d_pct=20.0, **zro
+            )
+        ],
+    )
+    _save_cross_perp_api_run(
+        store,
+        [
+            _CrossPerpObservation(
+                observed_at_ms=7_201_000, net_apr_7d_pct=20.0, **zro
+            ),
+            _CrossPerpObservation(
+                asset="ARB",
+                external_venue="binance",
+                external_symbol="ARBUSDT",
+                direction="long_hyperliquid_short_external",
+                observed_at_ms=7_201_000,
+                net_apr_7d_pct=30.0,
+            ),
+        ],
+    )
+    client = TestClient(create_app(db_path))
+
+    opportunities = client.get("/api/cross-perp/opportunities").json()
+    ready = client.get(
+        "/api/cross-perp/opportunities?observation_ready_only=true"
+    ).json()
+
+    assert [item["asset"] for item in opportunities] == ["ARB", "ZRO"]
+    assert [item["asset"] for item in ready] == ["ZRO"]
+    assert ready[0]["streak"] == 3
+
+
+def test_cross_perp_history_requires_exact_route_and_allowed_direction(tmp_path) -> None:
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    _save_cross_perp_api_run(
+        store,
+        [
+            _CrossPerpObservation(
+                asset="ZRO",
+                external_venue="binance",
+                external_symbol="ZROUSDT",
+                direction="short_hyperliquid_long_external",
+                observed_at_ms=1_000,
+                net_apr_7d_pct=20.0,
+            )
+        ],
+    )
+    client = TestClient(create_app(db_path))
+    route = (
+        "/api/cross-perp/history?asset=ZRO&external_venue=binance&"
+        "direction=short_hyperliquid_long_external"
+    )
+
+    assert len(client.get(route).json()) == 1
+    assert client.get(route.replace("asset=ZRO", "asset=ARB")).json() == []
+    assert client.get(
+        route.replace("external_venue=binance", "external_venue=okx")
+    ).json() == []
+    assert client.get(
+        route.replace(
+            "short_hyperliquid_long_external", "long_hyperliquid_short_external"
+        )
+    ).json() == []
+    assert client.get(
+        route.replace("short_hyperliquid_long_external", "invalid")
+    ).status_code == 422
+    assert client.get("/api/cross-perp/history").status_code == 422
+
+
+def test_cross_perp_api_limits_are_bounded(tmp_path) -> None:
+    client = TestClient(create_app(str(tmp_path / "test.db")))
+    history = (
+        "/api/cross-perp/history?asset=ZRO&external_venue=binance&"
+        "direction=short_hyperliquid_long_external&limit="
+    )
+
+    for url in ("/api/cross-perp/opportunities?limit=", history):
+        assert client.get(f"{url}0").status_code == 422
+        assert client.get(f"{url}501").status_code == 422
+
+
+def test_cross_perp_api_read_token_protects_all_routes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FUNDING_ARB_READ_TOKEN", "read-secret")
+    client = TestClient(create_app(str(tmp_path / "test.db")))
+    routes = (
+        "/api/cross-perp/summary",
+        "/api/cross-perp/opportunities",
+        "/api/cross-perp/history?asset=ZRO&external_venue=binance&"
+        "direction=short_hyperliquid_long_external",
+    )
+
+    for route in routes:
+        assert client.get(route).status_code == 401
+        assert client.get(
+            route, headers={"X-Read-Token": "read-secret"}
+        ).status_code == 200
+
+
 def test_dashboard_and_api_are_available(tmp_path) -> None:
     db_path = str(tmp_path / "test.db")
     store = Store(db_path)
