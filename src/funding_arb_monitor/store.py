@@ -621,6 +621,15 @@ class Store:
 
     def scheduler_health(self, *, now_ms: int | None = None) -> dict[str, object]:
         current_ms = now_ms or int(time.time() * 1000)
+        critical_jobs = {
+            "scan",
+            "shadow",
+            "accrue",
+            "update",
+            "report",
+            "heartbeat",
+            "backup",
+        }
         max_age_ms = {
             "scan": 2 * 3_600_000,
             "shadow": 2 * 3_600_000,
@@ -650,6 +659,8 @@ class Store:
             item = dict(row)
             latest.append(item)
             name = str(row["name"])
+            if name not in critical_jobs:
+                continue
             if row["status"] != "success":
                 unhealthy.append(f"{name}:{row['status']}")
                 continue

@@ -134,6 +134,23 @@ def test_readyz_rejects_a_failed_critical_scheduler_job(tmp_path, monkeypatch) -
     assert response.json()["detail"] == "scheduled jobs are unhealthy"
 
 
+def test_readyz_allows_a_failed_cross_perp_scheduler_job(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FUNDING_ARB_SCHEDULER", "1")
+    db_path = str(tmp_path / "test.db")
+    store = Store(db_path)
+    store.initialize()
+    run_id = store.start_scan_run()
+    store.finish_scan_run(run_id, status="success")
+    job_run_id = store.start_scheduled_job("cross-perp", "2026-07-30T18:06")
+    store.finish_scheduled_job(job_run_id, exit_code=2, error="venue outage")
+    client = TestClient(create_app(db_path))
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
 def test_candidates_can_be_filtered_to_eligible_only(tmp_path) -> None:
     db_path = str(tmp_path / "test.db")
     store = Store(db_path)

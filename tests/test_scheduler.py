@@ -24,6 +24,13 @@ def test_shadow_paper_job_runs_after_hourly_scan() -> None:
     assert [job.name for job in due_jobs(datetime(2026, 7, 23, 18, 7), {})] == ["shadow"]
 
 
+def test_cross_perp_runs_after_hourly_scan() -> None:
+    jobs = due_jobs(datetime(2026, 7, 30, 18, 6), {})
+
+    assert [job.name for job in jobs] == ["cross-perp"]
+    assert jobs[0].command == ("cross-perp",)
+
+
 def test_daily_heartbeat_follows_report() -> None:
     assert [job.name for job in due_jobs(datetime(2026, 7, 23, 17, 16), {})] == [
         "heartbeat"
@@ -72,3 +79,16 @@ def test_scheduler_health_flags_an_overdue_hourly_job(tmp_path) -> None:
 
     assert health["healthy"] is False
     assert health["unhealthy_jobs"] == ["update:overdue"]
+
+
+def test_failed_cross_perp_job_is_visible_but_not_critical(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    run_id = store.start_scheduled_job("cross-perp", "2026-07-30T18:06")
+    store.finish_scheduled_job(run_id, exit_code=2, error="venue outage")
+
+    health = store.scheduler_health()
+
+    latest = next(row for row in health["latest_jobs"] if row["name"] == "cross-perp")
+    assert latest["status"] == "failed"
+    assert health["unhealthy_jobs"] == []
