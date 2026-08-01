@@ -59,8 +59,8 @@ docs remain at http://127.0.0.1:8080/docs. The summary distinguishes fresh and s
 current ideas without an exact spot hedge, and progress toward the paper-validation evidence gate.
 
 Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/candidates`
-(add `?eligible_only=true` to filter or `?current_scan_only=true` for the actionable batch),
-`GET /api/opportunities/actionable`,
+(add `?eligible_only=true` to filter or `?current_scan_only=true` for the current monitoring batch),
+`GET /api/opportunities/monitoring`, `GET /api/opportunities/actionable`,
 `GET /api/opportunities/ranked`, `GET /api/opportunities/funnel`,
 `GET /api/analytics/rejections`,
 `GET /api/paper/recommendations`, `GET /api/paper/match-checks`, `GET /api/paper/positions`,
@@ -72,10 +72,11 @@ Useful endpoints: `GET /healthz`, `GET /readyz`, `GET /api/status`, `GET /api/ca
 The candidate API and dashboard retain the newest analysis for every market observed across
 rotating scan batches. Each row displays its analysis age. Paper matching and recommendations use
 only the current hourly batch, so an older eligible result remains visible but cannot be approved.
-Every candidate includes `scan_id`, `analysis_age_seconds`, and `actionable_now`.
-`/api/opportunities/actionable` is the machine-consumption endpoint: it returns only eligible rows
-attached to the latest successful scan. Historical eligibility must never be treated as an order
-signal.
+Every candidate includes `scan_id`, `analysis_age_seconds`, `monitoring_current`, and
+`actionable_now`. `/api/opportunities/monitoring` returns monitoring-eligible rows attached to the
+latest successful scan. `/api/opportunities/actionable` is fail-closed and returns only rows whose
+exact hedge, two-sided depth, fresh perp quote, and net carry checks reached `pending_approval`.
+Historical or monitoring eligibility must never be treated as an order signal.
 
 The execution funnel connects the latest successful scan to exact spot matching, depth, costs,
 perp execution, and paper entry. Ranked opportunities use executable net APR when a match check is
@@ -93,17 +94,28 @@ funding-arb-monitor --db data/funding_arb.db cross-perp
 
 It compares Hyperliquid with Binance and OKX perpetual markets in both directions: short
 Hyperliquid/long external and long Hyperliquid/short external. For each matching route it records
-seven-day gross and net carry, executable two-sided depth, basis, and rejection reasons. A route is
-qualified only when public history and quotes are fresh, both legs can fill the $1,000 notional,
-basis is within the configured limit, and the seven-day net carry remains positive after fees and
-slippage. A qualified route becomes `Observation ready` only after three consecutive qualifying
-scans; that label is evidence for monitoring, never an execution signal.
+seven-day gross and net carry, executable two-sided depth, basis, and rejection reasons. During a
+long scan, Hyperliquid marks are refreshed in rolling 30-second batches while public external calls
+remain bounded. A route is qualified only when public history and quotes are fresh, both legs can
+fill the $1,000 notional, basis is within the configured limit, seven-day net profit is at least $5,
+expected funding is at least twice modeled transaction costs, and carry remains positive after an
+additional 10 bps slippage stress. A qualified route becomes `Observation ready` only after three
+consecutive qualifying scans; that label is evidence for monitoring, never an execution signal.
 
 The protected read endpoints are `GET /api/cross-perp/summary`,
 `GET /api/cross-perp/opportunities`, and `GET /api/cross-perp/history`. They expose monitoring
 evidence only: this feature remains read-only, accepts no exchange credentials, and is not
 actionable or approved for trading. Cross-perpetual degradation is shown in the dashboard and
 summary endpoint but is non-critical to `/readyz`.
+
+### Optional Zhihuiti integration
+
+Zhihuiti can consume the protected read APIs as a downstream explanation and alert-prioritization
+layer. Keep it outside the scanner, deterministic qualification rules, scheduler health, paper
+ledger, and any approval path. Give it sanitized observations only; never exchange credentials or
+mutation tokens. Oracle predictions may add narrative context or anomaly alerts, but they must not
+change `qualified`, `observation_ready`, cost calculations, or order state. If Zhihuiti is down, the
+monitor and all safety gates must continue operating unchanged.
 
 ## Paper positions
 

@@ -36,6 +36,7 @@ class _CrossPerpObservation:
             "external_symbol": self.external_symbol,
             "direction": self.direction,
             "qualified": True,
+            "qualification_version": 2,
             "net_apr_7d_pct": self.net_apr_7d_pct,
             "reasons": list(self.reasons),
         }
@@ -69,6 +70,10 @@ def test_cross_perp_api_empty_state(tmp_path) -> None:
         "evaluation_count": 0,
         "positive_net_count": 0,
         "ready_count": 0,
+        "max_streak": 0,
+        "last_ready_at_ms": None,
+        "last_ready_run_id": None,
+        "last_ready_count": 0,
         "rejection_counts": {},
     }
     assert client.get("/api/cross-perp/opportunities").json() == []
@@ -160,6 +165,23 @@ def test_cross_perp_opportunities_are_ranked_and_can_require_ready_streaks(
     assert [item["asset"] for item in opportunities] == ["ARB", "ZRO"]
     assert [item["asset"] for item in ready] == ["ZRO"]
     assert ready[0]["streak"] == 3
+    assert ready[0]["max_streak"] == 3
+    assert ready[0]["qualified_scans_24h"] == 3
+    assert ready[0]["observed_scans_24h"] == 3
+    assert ready[0]["last_ready_at_ms"] == 7_201_000
+    summary = client.get("/api/cross-perp/summary").json()
+    summary_fields = (
+        "max_streak",
+        "last_ready_at_ms",
+        "last_ready_run_id",
+        "last_ready_count",
+    )
+    assert {key: summary[key] for key in summary_fields} == {
+        "max_streak": 3,
+        "last_ready_at_ms": 7_201_000,
+        "last_ready_run_id": 3,
+        "last_ready_count": 1,
+    }
 
 
 def test_cross_perp_history_requires_exact_route_and_allowed_direction(tmp_path) -> None:
@@ -253,6 +275,8 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert 'id="cross-perp-status"' in dashboard.text
     assert 'id="cross-perp-counters"' in dashboard.text
     assert 'id="cross-perp-run-age"' in dashboard.text
+    assert 'id="cross-perp-max-streak"' in dashboard.text
+    assert 'id="cross-perp-last-ready"' in dashboard.text
     assert "Latest run age" in dashboard.text
     assert 'id="cross-perp-rows"' in dashboard.text
     assert 'id="cross-perp-empty"' in dashboard.text
@@ -260,7 +284,8 @@ def test_dashboard_and_api_are_available(tmp_path) -> None:
     assert "Actionable cross-perp" not in dashboard.text
     assert 'id="rejection-rows"' in dashboard.text
     assert 'id="strategy-rows"' in dashboard.text
-    assert "monitoring eligible" in dashboard.text
+    assert "monitoring current" in dashboard.text
+    assert "Funding / costs" in dashboard.text
     assert "Skip; perp execution costs consume carry" in dashboard.text
     assert "Trade recommendations &amp; proposed actions" in dashboard.text
     assert "Monitor only; wait for an exact spot listing" in dashboard.text
@@ -553,12 +578,15 @@ def test_actionable_opportunities_exclude_older_eligible_candidates(tmp_path) ->
 
     historical = client.get("/api/candidates?eligible_only=true").json()
     actionable = client.get("/api/opportunities/actionable").json()
+    monitoring = client.get("/api/opportunities/monitoring").json()
 
     assert historical[0]["coin"] == "OLDER"
     assert historical[0]["scan_id"] == first_run
     assert historical[0]["actionable_now"] is False
+    assert historical[0]["monitoring_current"] is False
     assert historical[0]["analysis_age_seconds"] >= 0
     assert actionable == []
+    assert monitoring == []
 
 
 def test_dashboard_labels_candidate_analysis_age(tmp_path) -> None:
@@ -648,6 +676,8 @@ def test_execution_funnel_and_ranking_use_latest_match_checks(tmp_path) -> None:
 
     funnel = client.get("/api/opportunities/funnel").json()
     ranked = client.get("/api/opportunities/ranked").json()
+    monitoring = client.get("/api/opportunities/monitoring").json()
+    actionable = client.get("/api/opportunities/actionable").json()
 
     assert funnel == {
         "scan_id": run_id,
@@ -664,6 +694,12 @@ def test_execution_funnel_and_ranking_use_latest_match_checks(tmp_path) -> None:
     assert ranked[0]["executable_net_apr_pct"] == 20
     assert ranked[1]["executable_net_apr_pct"] == -5
     assert ranked[1]["execution_status"] == "net_carry_below_threshold"
+    assert [item["coin"] for item in monitoring] == ["PROFIT", "LOSS"]
+    assert all(item["monitoring_current"] for item in monitoring)
+    assert all(item["actionable_now"] is False for item in monitoring)
+    assert [item["coin"] for item in actionable] == ["PROFIT"]
+    assert actionable[0]["execution_status"] == "pending_approval"
+    assert actionable[0]["actionable_now"] is True
 
 
 def test_rejection_analytics_counts_monitoring_and_execution_history(tmp_path) -> None:

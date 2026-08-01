@@ -119,7 +119,11 @@ def qualifying_observation(*, observed_at_ms: int):
             hyperliquid,
             external,
             "short_hyperliquid_long_external",
-            CrossPerpConfig(),
+            CrossPerpConfig(
+                min_net_profit_usd=0.0,
+                min_funding_cost_ratio=0.0,
+                stress_slippage_bps=0.0,
+            ),
             NOW_MS,
         ),
         observed_at_ms=observed_at_ms,
@@ -250,6 +254,49 @@ def test_evaluate_direction_retains_and_rejects_stale_mark_timestamps() -> None:
     )
     assert getattr(observation, "external_mark_at_ms", None) == stale_mark_at_ms
     assert observation.reasons == ("stale_mark",)
+
+
+def test_evaluate_direction_rejects_positive_carry_without_an_economic_buffer() -> None:
+    hyperliquid, external = _markets()
+
+    observation = evaluate_direction(
+        hyperliquid,
+        external,
+        "short_hyperliquid_long_external",
+        CrossPerpConfig(),
+        NOW_MS,
+    )
+
+    assert observation.net_apr_7d_pct > 0
+    assert observation.net_profit_usd == pytest.approx(
+        observation.expected_funding_usd - observation.transaction_cost_usd
+    )
+    assert observation.funding_cost_ratio < 2.0
+    assert observation.stress_net_profit_usd < 0
+    assert observation.reasons == (
+        "net_profit_below_minimum",
+        "cost_buffer_too_thin",
+        "stress_net_negative",
+    )
+
+
+def test_evaluate_direction_accepts_carry_with_cost_and_stress_buffers() -> None:
+    hyperliquid, external = _markets()
+    hyperliquid = replace(hyperliquid, funding_events=_funding_events(80.0))
+
+    observation = evaluate_direction(
+        hyperliquid,
+        external,
+        "short_hyperliquid_long_external",
+        CrossPerpConfig(),
+        NOW_MS,
+    )
+
+    assert observation.net_profit_usd >= 5.0
+    assert observation.funding_cost_ratio >= 2.0
+    assert observation.stress_net_profit_usd > 0
+    assert observation.qualified is True
+    assert observation.reasons == ()
 
 
 def test_evaluate_direction_rejects_missing_required_book_side() -> None:
@@ -613,6 +660,36 @@ def test_cross_perp_opportunities_recover_after_later_success(tmp_path) -> None:
     ]
 
 
+def test_cross_perp_qualification_version_change_resets_the_streak(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    legacy = replace(
+        qualifying_observation(observed_at_ms=NOW_MS),
+        qualification_version=1,
+    )
+    _save_cross_perp_run(store, [legacy])
+    _save_cross_perp_run(
+        store,
+        [replace(legacy, observed_at_ms=NOW_MS + 3_600_000)],
+    )
+
+    current = replace(
+        qualifying_observation(observed_at_ms=NOW_MS + 7_200_000),
+        qualification_version=2,
+    )
+    _save_cross_perp_run(store, [current])
+
+    latest = store.latest_cross_perp_observations()
+    assert latest[0]["qualification_version"] == 2
+    assert latest[0]["streak"] == 1
+    assert latest[0]["max_streak"] == 1
+    assert latest[0]["last_ready_at_ms"] is None
+    assert latest[0]["observation_ready"] is False
+    summary = store.cross_perp_summary()
+    assert summary["max_streak"] == 1
+    assert summary["last_ready_at_ms"] is None
+
+
 def test_cross_perp_summary_decodes_venue_status_and_rejections(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
@@ -897,6 +974,11 @@ def test_monitor_keeps_partial_hyperliquid_depth_per_direction(tmp_path) -> None
         hyperliquid=PartialBookHyperliquid(),
         venues=[FakeExternalVenue("binance", ("ZRO",))],
         store=store,
+        config=CrossPerpConfig(
+            min_net_profit_usd=0.0,
+            min_funding_cost_ratio=0.0,
+            stress_slippage_bps=0.0,
+        ),
         now_ms=lambda: NOW_MS,
     ).run()
 
@@ -1033,6 +1115,79 @@ def test_monitor_evaluates_early_external_routes_during_hyperliquid_acquisition(
         ("EARLY", "binance", "long_hyperliquid_short_external"),
         ("LATE", "binance", "long_hyperliquid_short_external"),
     ]
+
+
+def test_monitor_refreshes_hyperliquid_marks_during_a_long_scan(tmp_path) -> None:
+    clock = {"now_ms": NOW_MS}
+
+    class RefreshingHyperliquid(FakeHyperliquid):
+        def __init__(self) -> None:
+            super().__init__(("EARLY", "LATE"))
+            self.snapshot_calls = 0
+
+        def snapshots(self) -> list[MarketSnapshot]:
+            self.snapshot_calls += 1
+            return [
+                replace(
+                    snapshot,
+                    captured_at=datetime.fromtimestamp(
+                        clock["now_ms"] / 1_000, tz=timezone.utc
+                    ),
+                )
+                for snapshot in super().snapshots()
+            ]
+
+        def funding_history(self, coin: str, days: int):
+            if coin == "LATE":
+                clock["now_ms"] += 45_000
+            return super().funding_history(coin, days)
+
+        def perp_quote(
+            self, coin: str, dex: str, notional_usd: float
+        ) -> PerpQuote:
+            return replace(
+                super().perp_quote(coin, dex, notional_usd),
+                captured_at_ms=clock["now_ms"] - 1_000,
+            )
+
+    class RefreshingVenue(FakeExternalVenue):
+        def market(
+            self, instrument: PerpInstrument, *, days: int, notional_usd: float
+        ) -> ExternalPerpMarket:
+            market = super().market(
+                instrument, days=days, notional_usd=notional_usd
+            )
+            return replace(
+                market,
+                mark_captured_at_ms=clock["now_ms"] - 1_000,
+                quote=replace(
+                    market.quote, captured_at_ms=clock["now_ms"] - 1_000
+                ),
+            )
+
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    hyperliquid = RefreshingHyperliquid()
+
+    CrossPerpMonitor(
+        hyperliquid=hyperliquid,
+        venues=[RefreshingVenue("binance", ("EARLY", "LATE"))],
+        store=store,
+        config=CrossPerpConfig(snapshot_refresh_ms=30_000),
+        now_ms=lambda: clock["now_ms"],
+    ).run()
+
+    late_rows = [
+        row
+        for row in store.latest_cross_perp_observations()
+        if row["asset"] == "LATE"
+    ]
+    assert hyperliquid.snapshot_calls == 2
+    assert late_rows
+    assert all("stale_mark" not in row["reasons"] for row in late_rows)
+    assert {row["hyperliquid_mark_at_ms"] for row in late_rows} == {
+        clock["now_ms"]
+    }
 
 
 def test_monitor_cancels_pending_external_markets_on_hyperliquid_failure(

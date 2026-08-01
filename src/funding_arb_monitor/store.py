@@ -421,7 +421,11 @@ class Store:
                     if previous_run and previous_run["status"] == "success":
                         previous_observation = connection.execute(
                             """
-                            SELECT observed_at_ms, qualified, streak
+                            SELECT observed_at_ms, qualified, streak,
+                                COALESCE(
+                                    json_extract(payload_json, '$.qualification_version'),
+                                    1
+                                ) AS qualification_version
                             FROM cross_perp_observations
                             WHERE run_id = ?
                                 AND hyperliquid_dex = ?
@@ -442,6 +446,8 @@ class Store:
                     if (
                         previous_observation
                         and previous_observation["qualified"]
+                        and int(previous_observation["qualification_version"])
+                        == int(payload.get("qualification_version", 1))
                         and 0
                         <= int(payload["observed_at_ms"])
                         - int(previous_observation["observed_at_ms"])
@@ -522,19 +528,20 @@ class Store:
                 LIMIT 1
                 """
             ).fetchone()
-        if not row:
-            return {
-                "status": "never_run",
-                "venue_status": {},
-                "match_count": 0,
-                "evaluation_count": 0,
-                "positive_net_count": 0,
-                "ready_count": 0,
-                "rejection_counts": {},
-            }
-        result = dict(row)
-        result["venue_status"] = json.loads(str(result.pop("venue_status_json")))
-        with self.connect() as connection:
+            if not row:
+                return {
+                    "status": "never_run",
+                    "venue_status": {},
+                    "match_count": 0,
+                    "evaluation_count": 0,
+                    "positive_net_count": 0,
+                    "ready_count": 0,
+                    "max_streak": 0,
+                    "last_ready_at_ms": None,
+                    "last_ready_run_id": None,
+                    "last_ready_count": 0,
+                    "rejection_counts": {},
+                }
             observation_rows = connection.execute(
                 """
                 SELECT payload_json FROM cross_perp_observations
@@ -542,6 +549,59 @@ class Store:
                 """,
                 (row["id"],),
             ).fetchall()
+            current_stats = connection.execute(
+                """
+                SELECT COALESCE(MAX(streak), 0) AS max_streak,
+                    MAX(COALESCE(
+                        json_extract(payload_json, '$.qualification_version'), 1
+                    )) AS qualification_version
+                FROM cross_perp_observations
+                WHERE run_id = ?
+                """,
+                (row["id"],),
+            ).fetchone()
+            qualification_version = current_stats["qualification_version"]
+            last_ready = None
+            if qualification_version is not None:
+                last_ready = connection.execute(
+                    """
+                    SELECT o.run_id, MAX(o.observed_at_ms) AS observed_at_ms
+                    FROM cross_perp_observations o
+                    JOIN cross_perp_runs r ON r.id = o.run_id
+                    WHERE o.observation_ready = 1 AND r.status = 'success'
+                        AND COALESCE(
+                            json_extract(
+                                o.payload_json, '$.qualification_version'
+                            ), 1
+                        ) = ?
+                    GROUP BY o.run_id
+                    ORDER BY o.run_id DESC
+                    LIMIT 1
+                    """,
+                    (qualification_version,),
+                ).fetchone()
+            last_ready_count = 0
+            if last_ready:
+                last_ready_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM cross_perp_observations
+                        WHERE run_id = ? AND observation_ready = 1
+                            AND COALESCE(json_extract(
+                                payload_json, '$.qualification_version'
+                            ), 1) = ?
+                        """,
+                        (last_ready["run_id"], qualification_version),
+                    ).fetchone()[0]
+                )
+        result = dict(row)
+        result["venue_status"] = json.loads(str(result.pop("venue_status_json")))
+        result["max_streak"] = int(current_stats["max_streak"])
+        result["last_ready_at_ms"] = (
+            int(last_ready["observed_at_ms"]) if last_ready else None
+        )
+        result["last_ready_run_id"] = int(last_ready["run_id"]) if last_ready else None
+        result["last_ready_count"] = last_ready_count
         rejection_counts: dict[str, int] = {}
         for observation in observation_rows:
             for reason in json.loads(observation["payload_json"]).get("reasons", []):
@@ -554,18 +614,56 @@ class Store:
     def latest_cross_perp_observations(
         self, limit: int = 100, *, observation_ready_only: bool = False
     ) -> list[dict[str, object]]:
-        ready_clause = "AND observation_ready = 1" if observation_ready_only else ""
+        ready_clause = (
+            "AND current.observation_ready = 1" if observation_ready_only else ""
+        )
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT * FROM cross_perp_observations
-                WHERE run_id = (
+                WITH latest_run AS (
                     SELECT id FROM cross_perp_runs
                     WHERE status = 'success' AND completed_at_ms IS NOT NULL
                         AND id = (SELECT MAX(id) FROM cross_perp_runs)
+                ), latest_time AS (
+                    SELECT MAX(observed_at_ms) AS observed_at_ms
+                    FROM cross_perp_observations
+                    WHERE run_id = (SELECT id FROM latest_run)
+                ), route_stats AS (
+                    SELECT o.hyperliquid_dex, o.asset, o.external_venue,
+                        o.external_symbol, o.direction,
+                        COALESCE(json_extract(
+                            o.payload_json, '$.qualification_version'
+                        ), 1) AS qualification_version,
+                        MAX(o.streak) AS max_streak,
+                        MAX(CASE WHEN o.observation_ready = 1
+                            THEN o.observed_at_ms END) AS last_ready_at_ms,
+                        SUM(CASE WHEN o.observed_at_ms >= lt.observed_at_ms - 86400000
+                            AND o.qualified = 1 THEN 1 ELSE 0 END)
+                            AS qualified_scans_24h,
+                        SUM(CASE WHEN o.observed_at_ms >= lt.observed_at_ms - 86400000
+                            THEN 1 ELSE 0 END) AS observed_scans_24h
+                    FROM cross_perp_observations o
+                    JOIN cross_perp_runs r ON r.id = o.run_id AND r.status = 'success'
+                    CROSS JOIN latest_time lt
+                    GROUP BY o.hyperliquid_dex, o.asset, o.external_venue,
+                        o.external_symbol, o.direction, qualification_version
                 )
+                SELECT current.*, stats.max_streak, stats.last_ready_at_ms,
+                    stats.qualified_scans_24h, stats.observed_scans_24h
+                FROM cross_perp_observations current
+                LEFT JOIN route_stats stats
+                    ON stats.hyperliquid_dex = current.hyperliquid_dex
+                    AND stats.asset = current.asset
+                    AND stats.external_venue = current.external_venue
+                    AND stats.external_symbol = current.external_symbol
+                    AND stats.direction = current.direction
+                    AND stats.qualification_version = COALESCE(json_extract(
+                        current.payload_json, '$.qualification_version'
+                    ), 1)
+                WHERE current.run_id = (SELECT id FROM latest_run)
                 {ready_clause}
-                ORDER BY net_apr_7d_pct IS NULL, net_apr_7d_pct DESC, rowid
+                ORDER BY current.net_apr_7d_pct IS NULL,
+                    current.net_apr_7d_pct DESC, current.rowid
                 LIMIT ?
                 """,
                 (limit,),
@@ -1035,7 +1133,7 @@ class Store:
             ).fetchall()
         return self._candidate_rows(rows)
 
-    def actionable_candidates(self, limit: int = 100) -> list[dict[str, object]]:
+    def monitoring_candidates(self, limit: int = 100) -> list[dict[str, object]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -1054,6 +1152,17 @@ class Store:
                 (limit,),
             ).fetchall()
         return self._candidate_rows(rows)
+
+    def execution_ready_candidates(self, limit: int = 100) -> list[dict[str, object]]:
+        candidates = self.execution_ranked_candidates(limit=500)
+        ready = [
+            candidate
+            for candidate in candidates
+            if candidate["execution_status"] == "pending_approval"
+        ][:limit]
+        for candidate in ready:
+            candidate["actionable_now"] = True
+        return ready
 
     def execution_ranked_candidates(self, limit: int = 100) -> list[dict[str, object]]:
         latest_run = self.latest_successful_scan_run()
@@ -1246,11 +1355,12 @@ class Store:
             analyzed_at = datetime.fromisoformat(str(candidate["analyzed_at"])).timestamp()
             candidate["scan_id"] = scan_id
             candidate["analysis_age_seconds"] = max(0, int(now - analyzed_at))
-            candidate["actionable_now"] = bool(
+            candidate["monitoring_current"] = bool(
                 candidate.get("eligible")
                 and scan_id is not None
                 and int(scan_id) == latest_successful_id
             )
+            candidate["actionable_now"] = False
             output.append(candidate)
         return output
 
@@ -1269,8 +1379,19 @@ class Store:
             "net_apr_7d_pct",
         )
         result.update({column: row[column] for column in indexed_columns})
+        result["qualification_version"] = int(
+            result.get("qualification_version", 1)
+        )
         result["qualified"] = bool(row["qualified"])
         result["observation_ready"] = bool(row["observation_ready"])
+        for column in (
+            "max_streak",
+            "last_ready_at_ms",
+            "qualified_scans_24h",
+            "observed_scans_24h",
+        ):
+            if column in row.keys():
+                result[column] = row[column]
         result["observation_age_seconds"] = max(
             0, int(time.time() - int(row["observed_at_ms"]) / 1000)
         )

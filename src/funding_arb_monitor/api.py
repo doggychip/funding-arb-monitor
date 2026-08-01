@@ -132,7 +132,13 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def actionable_opportunities(
         limit: int = Query(default=100, ge=1, le=500),
     ) -> list[dict[str, object]]:
-        return store.actionable_candidates(limit)
+        return store.execution_ready_candidates(limit)
+
+    @app.get("/api/opportunities/monitoring")
+    def monitoring_opportunities(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, object]]:
+        return store.monitoring_candidates(limit)
 
     @app.get("/api/opportunities/ranked")
     def ranked_opportunities(
