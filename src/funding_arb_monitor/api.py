@@ -178,6 +178,31 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> list[dict[str, object]]:
         return store.cross_perp_history(asset, external_venue, direction, limit)
 
+    @app.get("/api/cross-perp/preflight")
+    def cross_perp_preflight_checks(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, object]]:
+        return store.latest_cross_perp_entry_checks(limit)
+
+    @app.get("/api/cross-perp/paper/positions")
+    def cross_perp_paper_positions(
+        include_closed: bool = False,
+    ) -> list[dict[str, object]]:
+        return store.cross_perp_paper_positions(include_closed=include_closed)
+
+    @app.get("/api/cross-perp/paper/positions/{position_id}/timeline")
+    def cross_perp_paper_timeline(position_id: int) -> dict[str, object]:
+        timeline = store.cross_perp_paper_timeline(position_id)
+        if timeline is None:
+            raise HTTPException(
+                status_code=404, detail="cross-perp paper position not found"
+            )
+        return timeline
+
+    @app.get("/api/cross-perp/paper/attribution")
+    def cross_perp_paper_attribution() -> dict[str, object]:
+        return store.cross_perp_paper_attribution()
+
     @app.get("/api/status")
     def status() -> dict[str, object]:
         result = store.latest_scan_run() or {"status": "never_run"}

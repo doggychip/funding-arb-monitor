@@ -116,6 +116,77 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_cross_perp_latest
                 ON cross_perp_observations(run_id, observation_ready, net_apr_7d_pct);
+                CREATE TABLE IF NOT EXISTS cross_perp_entry_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checked_at_ms INTEGER NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    hyperliquid_dex TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    external_venue TEXT NOT NULL,
+                    external_symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    FOREIGN KEY (source_run_id) REFERENCES cross_perp_runs(id)
+                );
+                CREATE TABLE IF NOT EXISTS cross_perp_paper_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entry_check_id INTEGER NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    opened_at_ms INTEGER NOT NULL,
+                    closed_at_ms INTEGER,
+                    hyperliquid_dex TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    external_venue TEXT NOT NULL,
+                    external_symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    notional_usd REAL NOT NULL,
+                    hyperliquid_entry_price REAL NOT NULL,
+                    external_entry_price REAL NOT NULL,
+                    hyperliquid_quantity REAL NOT NULL,
+                    external_quantity REAL NOT NULL,
+                    entry_fee_usd REAL NOT NULL,
+                    estimated_exit_fee_usd REAL NOT NULL,
+                    forecast_funding_usd REAL NOT NULL,
+                    forecast_transaction_cost_usd REAL NOT NULL,
+                    forecast_net_profit_usd REAL NOT NULL,
+                    forecast_net_apr_pct REAL NOT NULL,
+                    forecast_basis_bps REAL NOT NULL,
+                    exit_reason TEXT,
+                    hyperliquid_exit_price REAL,
+                    external_exit_price REAL,
+                    exit_fee_usd REAL,
+                    FOREIGN KEY (entry_check_id) REFERENCES cross_perp_entry_checks(id),
+                    FOREIGN KEY (source_run_id) REFERENCES cross_perp_runs(id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cross_perp_paper_open_route
+                ON cross_perp_paper_positions(
+                    hyperliquid_dex, asset, external_venue, external_symbol, direction
+                ) WHERE closed_at_ms IS NULL;
+                CREATE TABLE IF NOT EXISTS cross_perp_paper_marks (
+                    position_id INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    hyperliquid_exit_price REAL NOT NULL,
+                    external_exit_price REAL NOT NULL,
+                    hyperliquid_pnl_usd REAL NOT NULL,
+                    external_pnl_usd REAL NOT NULL,
+                    basis_bps REAL NOT NULL,
+                    net_apr_7d_pct REAL,
+                    qualified INTEGER NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    PRIMARY KEY (position_id, timestamp_ms),
+                    FOREIGN KEY (position_id) REFERENCES cross_perp_paper_positions(id)
+                );
+                CREATE TABLE IF NOT EXISTS cross_perp_paper_accruals (
+                    position_id INTEGER NOT NULL,
+                    leg TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    funding_rate REAL NOT NULL,
+                    funding_pnl_usd REAL NOT NULL,
+                    PRIMARY KEY (position_id, leg, timestamp_ms),
+                    FOREIGN KEY (position_id) REFERENCES cross_perp_paper_positions(id)
+                );
                 CREATE TABLE IF NOT EXISTS paper_recommendations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at_ms INTEGER NOT NULL,
@@ -684,6 +755,378 @@ class Store:
                 (asset, external_venue, direction, limit),
             ).fetchall()
         return [self._cross_perp_row(row) for row in rows]
+
+    def cross_perp_transitions(self, run_id: int) -> list[dict[str, object]]:
+        """Return state changes for one completed run without mutating route state."""
+        with self.connect() as connection:
+            previous_run = connection.execute(
+                """
+                SELECT id FROM cross_perp_runs
+                WHERE id < ? AND status = 'success'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            current_rows = connection.execute(
+                "SELECT * FROM cross_perp_observations WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            previous_rows = (
+                connection.execute(
+                    "SELECT * FROM cross_perp_observations WHERE run_id = ?",
+                    (previous_run["id"],),
+                ).fetchall()
+                if previous_run
+                else []
+            )
+
+        def key(row: sqlite3.Row) -> tuple[object, ...]:
+            return (
+                row["hyperliquid_dex"],
+                row["asset"],
+                row["external_venue"],
+                row["external_symbol"],
+                row["direction"],
+            )
+
+        previous = {key(row): row for row in previous_rows}
+        current = {key(row): row for row in current_rows}
+        events: list[dict[str, object]] = []
+        economic_reasons = {
+            "net_carry_non_positive",
+            "net_profit_below_minimum",
+            "cost_buffer_too_thin",
+            "stress_net_negative",
+        }
+        for route, row in current.items():
+            prior = previous.get(route)
+            current_payload = json.loads(row["payload_json"])
+            previous_payload = json.loads(prior["payload_json"]) if prior else {}
+            current_reasons = set(current_payload.get("reasons", []))
+            previous_reasons = set(previous_payload.get("reasons", []))
+            event_types: list[str] = []
+            if bool(row["observation_ready"]) and not bool(
+                prior and prior["observation_ready"]
+            ):
+                event_types.append("became_ready")
+            if prior and bool(prior["observation_ready"]) and not bool(
+                row["observation_ready"]
+            ):
+                event_types.append("lost_ready")
+            if (
+                prior is not None
+                and "insufficient_depth" in current_reasons
+                and "insufficient_depth" not in previous_reasons
+            ):
+                event_types.append("depth_deteriorated")
+            if prior and (current_reasons & economic_reasons) - previous_reasons:
+                event_types.append("economics_deteriorated")
+            for event_type in event_types:
+                events.append(
+                    {
+                        "event_type": event_type,
+                        "run_id": run_id,
+                        "asset": row["asset"],
+                        "external_venue": row["external_venue"],
+                        "external_symbol": row["external_symbol"],
+                        "direction": row["direction"],
+                        "streak": int(row["streak"]),
+                        "net_apr_7d_pct": row["net_apr_7d_pct"],
+                        "reasons": sorted(current_reasons),
+                    }
+                )
+        for route, prior in previous.items():
+            if route in current or not bool(prior["observation_ready"]):
+                continue
+            events.append(
+                {
+                    "event_type": "lost_ready",
+                    "run_id": run_id,
+                    "asset": prior["asset"],
+                    "external_venue": prior["external_venue"],
+                    "external_symbol": prior["external_symbol"],
+                    "direction": prior["direction"],
+                    "streak": 0,
+                    "net_apr_7d_pct": None,
+                    "reasons": ["route_missing"],
+                }
+            )
+        return events
+
+    def save_cross_perp_entry_check(
+        self,
+        *,
+        source_run_id: int,
+        route: dict[str, object],
+        status: str,
+        reasons: list[str],
+        payload: dict[str, object],
+        checked_at_ms: int,
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO cross_perp_entry_checks (
+                    checked_at_ms, source_run_id, hyperliquid_dex, asset,
+                    external_venue, external_symbol, direction, status,
+                    reasons_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checked_at_ms,
+                    source_run_id,
+                    route["hyperliquid_dex"],
+                    route["asset"],
+                    route["external_venue"],
+                    route["external_symbol"],
+                    route["direction"],
+                    status,
+                    json.dumps(reasons, separators=(",", ":")),
+                    json.dumps(payload, separators=(",", ":")),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def latest_cross_perp_entry_checks(
+        self, limit: int = 100
+    ) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM cross_perp_entry_checks
+                ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        output: list[dict[str, object]] = []
+        for row in rows:
+            item = dict(row)
+            item["reasons"] = json.loads(str(item.pop("reasons_json")))
+            item["evidence"] = json.loads(str(item.pop("payload_json")))
+            output.append(item)
+        return output
+
+    def open_cross_perp_paper_position(
+        self,
+        *,
+        entry_check_id: int,
+        source_run_id: int,
+        evidence: dict[str, object],
+        opened_at_ms: int,
+    ) -> int:
+        notional = float(evidence["notional_usd"])
+        hyperliquid_price = float(evidence["hyperliquid_executable_price"])
+        external_price = float(evidence["external_executable_price"])
+        entry_fee = notional * (
+            float(evidence["hyperliquid_fee_bps"])
+            + float(evidence["external_fee_bps"])
+        ) / 10_000
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO cross_perp_paper_positions (
+                    entry_check_id, source_run_id, opened_at_ms,
+                    hyperliquid_dex, asset, external_venue, external_symbol,
+                    direction, notional_usd, hyperliquid_entry_price,
+                    external_entry_price, hyperliquid_quantity,
+                    external_quantity, entry_fee_usd, estimated_exit_fee_usd,
+                    forecast_funding_usd, forecast_transaction_cost_usd,
+                    forecast_net_profit_usd, forecast_net_apr_pct,
+                    forecast_basis_bps
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry_check_id,
+                    source_run_id,
+                    opened_at_ms,
+                    evidence["hyperliquid_dex"],
+                    evidence["asset"],
+                    evidence["external_venue"],
+                    evidence["external_symbol"],
+                    evidence["direction"],
+                    notional,
+                    hyperliquid_price,
+                    external_price,
+                    notional / hyperliquid_price,
+                    notional / external_price,
+                    entry_fee,
+                    entry_fee,
+                    evidence["expected_funding_usd"],
+                    evidence["transaction_cost_usd"],
+                    evidence["net_profit_usd"],
+                    evidence["net_apr_7d_pct"],
+                    evidence["basis_bps"],
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def cross_perp_paper_positions(
+        self, *, include_closed: bool = True
+    ) -> list[dict[str, object]]:
+        where = "" if include_closed else "WHERE p.closed_at_ms IS NULL"
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.*,
+                    COALESCE((SELECT SUM(a.funding_pnl_usd)
+                        FROM cross_perp_paper_accruals a
+                        WHERE a.position_id = p.id), 0) AS funding_pnl_usd,
+                    COALESCE((SELECT m.hyperliquid_pnl_usd + m.external_pnl_usd
+                        FROM cross_perp_paper_marks m
+                        WHERE m.position_id = p.id
+                        ORDER BY m.timestamp_ms DESC LIMIT 1), 0) AS pair_mtm_usd
+                FROM cross_perp_paper_positions p
+                {where}
+                ORDER BY p.opened_at_ms DESC
+                """
+            ).fetchall()
+        return [self._cross_perp_paper_row(row) for row in rows]
+
+    def open_cross_perp_paper_positions(self) -> list[dict[str, object]]:
+        return self.cross_perp_paper_positions(include_closed=False)
+
+    def save_cross_perp_paper_accruals(
+        self,
+        position_id: int,
+        entries: list[tuple[str, int, float, float]],
+    ) -> None:
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO cross_perp_paper_accruals (
+                    position_id, leg, timestamp_ms, funding_rate, funding_pnl_usd
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (position_id, leg, timestamp_ms, rate, pnl)
+                    for leg, timestamp_ms, rate, pnl in entries
+                ],
+            )
+
+    def save_cross_perp_paper_mark(
+        self,
+        position_id: int,
+        *,
+        timestamp_ms: int,
+        hyperliquid_exit_price: float,
+        external_exit_price: float,
+        hyperliquid_pnl_usd: float,
+        external_pnl_usd: float,
+        basis_bps: float,
+        net_apr_7d_pct: float | None,
+        qualified: bool,
+        reasons: list[str],
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO cross_perp_paper_marks VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    position_id,
+                    timestamp_ms,
+                    hyperliquid_exit_price,
+                    external_exit_price,
+                    hyperliquid_pnl_usd,
+                    external_pnl_usd,
+                    basis_bps,
+                    net_apr_7d_pct,
+                    int(qualified),
+                    json.dumps(reasons, separators=(",", ":")),
+                ),
+            )
+
+    def close_cross_perp_paper_position(
+        self,
+        position_id: int,
+        *,
+        closed_at_ms: int,
+        reason: str,
+        hyperliquid_exit_price: float,
+        external_exit_price: float,
+        exit_fee_usd: float,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE cross_perp_paper_positions
+                SET closed_at_ms = ?, exit_reason = ?,
+                    hyperliquid_exit_price = ?, external_exit_price = ?,
+                    exit_fee_usd = ?
+                WHERE id = ? AND closed_at_ms IS NULL
+                """,
+                (
+                    closed_at_ms,
+                    reason,
+                    hyperliquid_exit_price,
+                    external_exit_price,
+                    exit_fee_usd,
+                    position_id,
+                ),
+            )
+
+    def cross_perp_paper_timeline(self, position_id: int) -> dict[str, object] | None:
+        positions = [
+            item
+            for item in self.cross_perp_paper_positions()
+            if int(item["id"]) == position_id
+        ]
+        if not positions:
+            return None
+        with self.connect() as connection:
+            marks = connection.execute(
+                """
+                SELECT * FROM cross_perp_paper_marks
+                WHERE position_id = ? ORDER BY timestamp_ms
+                """,
+                (position_id,),
+            ).fetchall()
+            accruals = connection.execute(
+                """
+                SELECT * FROM cross_perp_paper_accruals
+                WHERE position_id = ? ORDER BY timestamp_ms, leg
+                """,
+                (position_id,),
+            ).fetchall()
+        return {
+            "position": positions[0],
+            "marks": [
+                {
+                    **dict(row),
+                    "qualified": bool(row["qualified"]),
+                    "reasons": json.loads(row["reasons_json"]),
+                }
+                for row in marks
+            ],
+            "funding_accruals": [dict(row) for row in accruals],
+        }
+
+    def cross_perp_paper_attribution(self) -> dict[str, object]:
+        positions = self.cross_perp_paper_positions()
+        closed = [item for item in positions if item["closed_at_ms"] is not None]
+        return {
+            "open_positions": len(positions) - len(closed),
+            "closed_positions": len(closed),
+            "realized_net_pnl_usd": sum(
+                float(item["actual_net_pnl_usd"]) for item in closed
+            ),
+            "forecast_net_profit_usd": sum(
+                float(item["forecast_net_profit_usd"]) for item in closed
+            ),
+            "forecast_error_usd": sum(
+                float(item["forecast_error_usd"]) for item in closed
+            ),
+            "funding_variance_usd": sum(
+                float(item["funding_variance_usd"]) for item in closed
+            ),
+            "basis_mtm_usd": sum(float(item["pair_mtm_usd"]) for item in closed),
+            "cost_variance_usd": sum(
+                float(item["cost_variance_usd"]) for item in closed
+            ),
+            "positions": positions,
+        }
 
     def start_scheduled_job(self, name: str, scheduled_slot: str) -> int:
         with self.connect() as connection:
@@ -1394,6 +1837,34 @@ class Store:
                 result[column] = row[column]
         result["observation_age_seconds"] = max(
             0, int(time.time() - int(row["observed_at_ms"]) / 1000)
+        )
+        return result
+
+    @staticmethod
+    def _cross_perp_paper_row(row: sqlite3.Row) -> dict[str, object]:
+        result = dict(row)
+        funding_pnl = float(result["funding_pnl_usd"])
+        pair_mtm = float(result["pair_mtm_usd"])
+        actual_cost = float(result["entry_fee_usd"]) + float(
+            result["exit_fee_usd"]
+            if result["exit_fee_usd"] is not None
+            else result["estimated_exit_fee_usd"]
+        )
+        actual_net = funding_pnl + pair_mtm - actual_cost
+        forecast_funding = float(result["forecast_funding_usd"])
+        forecast_cost = float(result["forecast_transaction_cost_usd"])
+        forecast_net = float(result["forecast_net_profit_usd"])
+        closed = result["closed_at_ms"] is not None
+        result.update(
+            {
+                "actual_cost_usd": actual_cost,
+                "actual_net_pnl_usd": actual_net,
+                "funding_variance_usd": (
+                    funding_pnl - forecast_funding if closed else None
+                ),
+                "cost_variance_usd": forecast_cost - actual_cost if closed else None,
+                "forecast_error_usd": actual_net - forecast_net if closed else None,
+            }
         )
         return result
 

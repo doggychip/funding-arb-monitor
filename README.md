@@ -103,10 +103,21 @@ additional 10 bps slippage stress. A qualified route becomes `Observation ready`
 consecutive qualifying scans; that label is evidence for monitoring, never an execution signal.
 
 The protected read endpoints are `GET /api/cross-perp/summary`,
-`GET /api/cross-perp/opportunities`, and `GET /api/cross-perp/history`. They expose monitoring
-evidence only: this feature remains read-only, accepts no exchange credentials, and is not
-actionable or approved for trading. Cross-perpetual degradation is shown in the dashboard and
-summary endpoint but is non-critical to `/readyz`.
+`GET /api/cross-perp/opportunities`, `GET /api/cross-perp/history`,
+`GET /api/cross-perp/preflight`, `GET /api/cross-perp/paper/positions`, and
+`GET /api/cross-perp/paper/attribution`. They expose monitoring and simulation evidence only: this
+feature remains read-only, accepts no exchange credentials, and is not actionable or approved for
+trading. Cross-perpetual degradation is shown in the dashboard and summary endpoint but is
+non-critical to `/readyz`.
+
+After the hourly scan, every 3/3 observation-ready route receives a second public-data check. The
+check independently refreshes both perpetual books, funding histories, marks, depth, fees, basis,
+and the deterministic qualification rules. A shadow position opens only when that check passes.
+The paper ledger records both leg quantities, venue-specific funding accruals, executable pair MTM,
+fees, conservative exits, and forecast-versus-actual attribution. It closes a simulation when the
+route loses observation readiness, the second check no longer qualifies, or the seven-day holding
+limit is reached. Transition alerts are emitted only when a route becomes ready, loses readiness,
+or newly suffers depth/economic deterioration; repeated unchanged scans do not alert again.
 
 ### Optional Zhihuiti integration
 
@@ -248,10 +259,12 @@ the SQLite scan and paper-trading history.
 ### Additive database migration
 
 Back up the `/data` volume before deployment. On startup, `Store.initialize()` creates the
-`paper_liquidity_checks` and `alert_deliveries` tables and adds nullable exit-execution columns to
-`paper_positions`. Existing rows and IDs are preserved. Verify `/healthz`, the current paper
-position, and `/api/alerts/deliveries` after deployment. Rolling back the application image is safe
-because the previous version ignores these additive tables and columns.
+`paper_liquidity_checks`, `alert_deliveries`, `cross_perp_entry_checks`,
+`cross_perp_paper_positions`, `cross_perp_paper_marks`, and `cross_perp_paper_accruals` tables and
+adds nullable exit-execution columns to `paper_positions`. Existing rows and IDs are preserved.
+Verify `/healthz`, both paper ledgers, the cross-perpetual attribution endpoint, and
+`/api/alerts/deliveries` after deployment. Rolling back the application image is safe because the
+previous version ignores these additive tables and columns.
 
 ### Integrity, backup, and restore
 

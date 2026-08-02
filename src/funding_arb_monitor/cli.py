@@ -14,6 +14,7 @@ from .alerts import (
 )
 from .api import create_app
 from .cross_perp import CrossPerpMonitor
+from .cross_perp_paper import CrossPerpShadowEngine, PublicCrossPerpPreflight
 from .cross_perp_venues import BinancePerpVenue, OkxPerpVenue
 from .hyperliquid import HyperliquidClient
 from .matcher import PaperMatcher
@@ -136,10 +137,16 @@ def main() -> None:
 
     store.initialize()
     if args.command == "cross-perp":
+        hyperliquid = HyperliquidClient()
+        venues = [BinancePerpVenue(), OkxPerpVenue()]
         result = CrossPerpMonitor(
-            HyperliquidClient(),
-            [BinancePerpVenue(), OkxPerpVenue()],
+            hyperliquid,
+            venues,
             store,
+        ).run()
+        result["shadow"] = CrossPerpShadowEngine(
+            store,
+            PublicCrossPerpPreflight(hyperliquid, venues),
         ).run()
         print(json.dumps(result, indent=2))
         return

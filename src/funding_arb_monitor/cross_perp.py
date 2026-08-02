@@ -7,6 +7,10 @@ from statistics import median
 from threading import BoundedSemaphore, Lock
 from typing import Callable
 
+from funding_arb_monitor.alerts import (
+    render_cross_perp_transitions,
+    send_discord_alert,
+)
 from funding_arb_monitor.cross_perp_venues import (
     ExternalPerpVenue,
     ExternalPerpMarket,
@@ -297,6 +301,13 @@ class CrossPerpMonitor:
             ),
             ready_count=sum(bool(item["observation_ready"]) for item in saved),
         )
+        transitions = self.store.cross_perp_transitions(run_id)
+        if transitions:
+            send_discord_alert(
+                render_cross_perp_transitions(transitions),
+                store=self.store,
+                event_type="cross_perp_state_changed",
+            )
         return self.store.cross_perp_summary()
 
     def _finish_failed(

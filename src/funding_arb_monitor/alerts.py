@@ -128,6 +128,48 @@ def render_shadow_exit(position: dict[str, object]) -> str:
     )
 
 
+def render_cross_perp_transitions(events: list[dict[str, object]]) -> str:
+    labels = {
+        "became_ready": "READY 3/3",
+        "lost_ready": "LOST READINESS",
+        "depth_deteriorated": "DEPTH DETERIORATED",
+        "economics_deteriorated": "ECONOMICS DETERIORATED",
+    }
+    lines = ["🔎 **Cross-perpetual state changed**"]
+    for event in events[:12]:
+        net_apr = event.get("net_apr_7d_pct")
+        apr = "n/a" if net_apr is None else f"{float(net_apr):+.1f}%"
+        lines.append(
+            f"• **{labels.get(str(event['event_type']), str(event['event_type']))}** "
+            f"`{event['asset']}/{event['external_venue']}` · "
+            f"`{event['direction']}` · net APR `{apr}` · "
+            f"streak `{event['streak']}/3`"
+        )
+    lines.append("Observation and simulation only—no order was placed.")
+    return "\n".join(lines)
+
+
+def render_cross_perp_shadow_entry(position: dict[str, object]) -> str:
+    return (
+        "🧪 **Cross-perpetual shadow position opened**\n"
+        f"Route: `{position['asset']}/{position['external_venue']}`\n"
+        f"Direction: `{position['direction']}`\n"
+        f"Notional per leg: `${float(position['notional_usd']):,.0f}`\n"
+        f"Forecast 7d net: `${float(position['forecast_net_profit_usd']):+.2f}`\n"
+        "Second public-data preflight passed. Simulation only—no order was placed."
+    )
+
+
+def render_cross_perp_shadow_exit(position: dict[str, object]) -> str:
+    return (
+        "🏁 **Cross-perpetual shadow position closed**\n"
+        f"Route: `{position['asset']}/{position['external_venue']}`\n"
+        f"Reason: `{str(position['exit_reason']).replace('_', ' ')}`\n"
+        f"Actual net P&L: `${float(position['actual_net_pnl_usd']):+.2f}`\n"
+        f"Forecast error: `${float(position['forecast_error_usd']):+.2f}`"
+    )
+
+
 def render_scan_failure(error: Exception) -> str:
     return f"🚨 **Funding monitor scan failed**\n`{type(error).__name__}: {error}`"
 
