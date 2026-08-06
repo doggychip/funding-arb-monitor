@@ -105,7 +105,8 @@ consecutive qualifying scans; that label is evidence for monitoring, never an ex
 The protected read endpoints are `GET /api/cross-perp/summary`,
 `GET /api/cross-perp/opportunities`, `GET /api/cross-perp/history`,
 `GET /api/cross-perp/preflight`, `GET /api/cross-perp/execution-truth`,
-`GET /api/cross-perp/paper/positions`, and `GET /api/cross-perp/paper/attribution`. They expose
+`GET /api/cross-perp/funding-forecast-accuracy`, `GET /api/cross-perp/paper/positions`, and
+`GET /api/cross-perp/paper/attribution`. They expose
 monitoring and simulation evidence only: this
 feature remains read-only, accepts no exchange credentials, and is not actionable or approved for
 trading. Cross-perpetual degradation is shown in the dashboard and summary endpoint but is
@@ -116,7 +117,11 @@ uses the announced next funding rates and exact settlement schedules for a 24-ho
 requires at least 3x the $1,000 notional in visible depth, re-quotes both legs after 100, 250, and
 500 milliseconds, and reports a $250/$500/$1,000/$2,000 capacity curve. It also models collateral
 on both venues at fixed 2x leverage, a fee/slippage reserve, liquidation buffer, and return on total
-committed capital. A shadow position opens only when every execution-truth gate passes.
+committed capital. A shadow position opens only when every execution-truth gate passes for three
+distinct consecutive hourly scans. A one-off pass is reported as `warming`, never executable.
+Every announced payment in the 24-hour schedule is persisted and reconciled against the actual
+venue settlement. The accuracy endpoint reports directional sign accuracy, realized funding
+capture, mean absolute error per $1,000, pending forecasts, and route/leg breakdowns.
 The paper ledger records both leg quantities, venue-specific funding accruals, executable pair MTM,
 fees, conservative exits, and forecast-versus-actual-to-date attribution. Economic deterioration
 must persist for three consecutive checks before a normal exit; stale data, unfillable depth, an
@@ -124,6 +129,11 @@ excessive basis, or an inadequate liquidation buffer remains a hard exit. A clos
 24-hour re-entry cooldown. The seven-day holding limit remains in force. Transition alerts are
 emitted only when a route becomes ready, loses readiness,
 or newly suffers depth/economic deterioration; repeated unchanged scans do not alert again.
+
+Live-review eligibility is stricter than paper execution: at least 20 closed paper positions,
+12 profitable positions, positive aggregate net P&L, 30 reconciled directional funding forecasts,
+and at least 60% funding-direction accuracy are required. This remains a review gate, not
+authorization to place orders.
 
 ### Optional Zhihuiti integration
 
@@ -266,11 +276,12 @@ the SQLite scan and paper-trading history.
 
 Back up the `/data` volume before deployment. On startup, `Store.initialize()` creates the
 `paper_liquidity_checks`, `alert_deliveries`, `cross_perp_entry_checks`,
-`cross_perp_paper_positions`, `cross_perp_paper_marks`, and `cross_perp_paper_accruals` tables and
-adds nullable exit-execution columns to `paper_positions`. Existing rows and IDs are preserved.
+`cross_perp_paper_positions`, `cross_perp_paper_marks`, `cross_perp_paper_accruals`, and
+`cross_perp_funding_forecasts` tables and adds nullable exit-execution columns to
+`paper_positions`. Existing rows and IDs are preserved.
 It also adds nullable 24-hour forward-funding, forward-profit, committed-capital, and readiness
 columns to existing cross-perpetual paper positions. Verify `/healthz`, both paper ledgers, the
-cross-perpetual execution-truth and attribution endpoints, and
+cross-perpetual execution-truth, funding-forecast-accuracy, and attribution endpoints, and
 `/api/alerts/deliveries` after deployment. Rolling back the application image is safe because the
 previous version ignores these additive tables and columns.
 

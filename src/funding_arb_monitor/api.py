@@ -188,6 +188,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def cross_perp_execution_truth() -> dict[str, object]:
         return store.cross_perp_execution_truth_summary()
 
+    @app.get("/api/cross-perp/funding-forecast-accuracy")
+    def cross_perp_funding_forecast_accuracy() -> dict[str, object]:
+        return store.cross_perp_funding_forecast_accuracy()
+
     @app.get("/api/cross-perp/paper/positions")
     def cross_perp_paper_positions(
         include_closed: bool = False,

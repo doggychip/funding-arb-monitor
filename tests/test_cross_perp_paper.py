@@ -11,6 +11,7 @@ from funding_arb_monitor.cross_perp_paper import (
     CrossPerpPreflightEvidence,
     CrossPerpShadowEngine,
     DelayedLegSample,
+    ExecutionTruthConfig,
     evaluate_execution_truth,
 )
 from funding_arb_monitor.cross_perp_venues import PerpFundingEvent
@@ -98,6 +99,15 @@ class FakePreflight:
         return self.evidence
 
 
+def _engine(store: Store, preflight: object, *, now_ms) -> CrossPerpShadowEngine:
+    return CrossPerpShadowEngine(
+        store,
+        preflight,
+        execution_config=replace(ExecutionTruthConfig(), entry_truth_scans=1),
+        now_ms=now_ms,
+    )
+
+
 def _evidence(
     observed_at_ms: int,
     *,
@@ -154,6 +164,7 @@ def test_execution_truth_uses_forward_rates_and_requires_three_times_depth() -> 
 
     assert truth.hyperliquid_settlements == 24
     assert truth.external_settlements == 3
+    assert len(truth.forward_payments) == 27
     assert truth.forward_funding_usd == pytest.approx(23.4)
     assert truth.paper_executable is True
     assert truth.depth_multiple == 5
@@ -199,9 +210,7 @@ def test_shadow_engine_requires_ready_route_and_second_preflight(tmp_path) -> No
     now_ms = 7_202_000
     preflight = FakePreflight(_evidence(now_ms))
 
-    result = CrossPerpShadowEngine(
-        store, preflight, now_ms=lambda: now_ms
-    ).run()
+    result = _engine(store, preflight, now_ms=lambda: now_ms).run()
 
     assert ready["observation_ready"] is True
     assert result == {
@@ -218,6 +227,66 @@ def test_shadow_engine_requires_ready_route_and_second_preflight(tmp_path) -> No
     assert position["forecast_net_profit_usd"] == 38
 
 
+def test_shadow_engine_requires_three_distinct_execution_truth_scans(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _ready_route(store)
+    observed_at_ms = 7_202_000
+
+    for index in range(3):
+        if index:
+            _save_run(store, _observation(observed_at_ms))
+        result = CrossPerpShadowEngine(
+            store,
+            FakePreflight(_evidence(observed_at_ms)),
+            now_ms=lambda timestamp=observed_at_ms: timestamp,
+        ).run()
+        check = store.latest_cross_perp_entry_checks()[0]
+        assert check["evidence"]["execution_truth_streak"] == index + 1
+        assert check["status"] == ("passed" if index == 2 else "warming")
+        assert result["opened"] == int(index == 2)
+        if index == 0:
+            duplicate = CrossPerpShadowEngine(
+                store,
+                FakePreflight(_evidence(observed_at_ms)),
+                now_ms=lambda timestamp=observed_at_ms: timestamp,
+            ).run()
+            assert duplicate["opened"] == 0
+            assert store.latest_cross_perp_entry_checks()[0]["evidence"][
+                "execution_truth_streak"
+            ] == 1
+        observed_at_ms += 3_600_000
+
+    assert len(store.open_cross_perp_paper_positions()) == 1
+
+
+def test_funding_forecast_ledger_reconciles_actual_settlements(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _ready_route(store)
+    first_at_ms = 7_202_000
+    _engine(
+        store,
+        FakePreflight(_evidence(first_at_ms)),
+        now_ms=lambda: first_at_ms,
+    ).run()
+    settlement_at_ms = first_at_ms + 3_600_000
+    _save_run(store, _observation(settlement_at_ms))
+    _engine(
+        store,
+        FakePreflight(_evidence(settlement_at_ms)),
+        now_ms=lambda: settlement_at_ms,
+    ).run()
+
+    accuracy = store.cross_perp_funding_forecast_accuracy()
+    assert accuracy["total_predictions"] == 54
+    assert accuracy["reconciled_predictions"] == 2
+    assert accuracy["reconciled_directional_predictions"] == 2
+    assert accuracy["sign_accuracy_pct"] == 100
+    assert accuracy["capture_ratio_pct"] == pytest.approx(100)
+    assert accuracy["mean_absolute_error_usd"] == 0
+
+
 def test_shadow_engine_fails_closed_when_preflight_is_unavailable(tmp_path) -> None:
     store = Store(tmp_path / "test.db")
     store.initialize()
@@ -227,9 +296,7 @@ def test_shadow_engine_fails_closed_when_preflight_is_unavailable(tmp_path) -> N
         def refresh(self, route):
             raise RuntimeError("public book unavailable")
 
-    result = CrossPerpShadowEngine(
-        store, BrokenPreflight(), now_ms=lambda: 7_202_000
-    ).run()
+    result = _engine(store, BrokenPreflight(), now_ms=lambda: 7_202_000).run()
 
     assert result["checks_passed"] == 0
     assert result["opened"] == 0
@@ -244,7 +311,7 @@ def test_shadow_engine_closes_and_attributes_forecast_error(tmp_path) -> None:
     store.initialize()
     _ready_route(store)
     opened_at_ms = 7_202_000
-    CrossPerpShadowEngine(
+    _engine(
         store,
         FakePreflight(_evidence(opened_at_ms)),
         now_ms=lambda: opened_at_ms,
@@ -261,7 +328,7 @@ def test_shadow_engine_closes_and_attributes_forecast_error(tmp_path) -> None:
                 reasons=("net_carry_non_positive",),
             ),
         )
-        result = CrossPerpShadowEngine(
+        result = _engine(
             store,
             FakePreflight(_evidence(lost_at_ms, qualified=False)),
             now_ms=lambda timestamp=lost_at_ms: timestamp,
@@ -287,7 +354,7 @@ def test_shadow_engine_exits_immediately_for_hard_risk(tmp_path) -> None:
     store.initialize()
     _ready_route(store)
     opened_at_ms = 7_202_000
-    CrossPerpShadowEngine(
+    _engine(
         store,
         FakePreflight(_evidence(opened_at_ms)),
         now_ms=lambda: opened_at_ms,
@@ -302,7 +369,7 @@ def test_shadow_engine_exits_immediately_for_hard_risk(tmp_path) -> None:
         ),
     )
 
-    result = CrossPerpShadowEngine(
+    result = _engine(
         store,
         FakePreflight(
             _evidence(stale_at_ms, qualified=False, reasons=("stale_mark",))
@@ -321,7 +388,7 @@ def test_shadow_engine_enforces_route_reentry_cooldown(tmp_path) -> None:
     store.initialize()
     _ready_route(store)
     opened_at_ms = 7_202_000
-    CrossPerpShadowEngine(
+    _engine(
         store,
         FakePreflight(_evidence(opened_at_ms)),
         now_ms=lambda: opened_at_ms,
@@ -337,7 +404,7 @@ def test_shadow_engine_enforces_route_reentry_cooldown(tmp_path) -> None:
         exit_fee_usd=0.95,
     )
 
-    result = CrossPerpShadowEngine(
+    result = _engine(
         store,
         FakePreflight(_evidence(closed_at_ms + 1_000)),
         now_ms=lambda: closed_at_ms + 1_000,
@@ -345,7 +412,7 @@ def test_shadow_engine_enforces_route_reentry_cooldown(tmp_path) -> None:
 
     assert result["opened"] == 0
     check = store.latest_cross_perp_entry_checks()[0]
-    assert check["status"] == "failed"
+    assert check["status"] == "warming"
     assert "route_cooldown" in check["reasons"]
 
 
@@ -378,7 +445,7 @@ def test_cross_perp_paper_api_exposes_checks_positions_and_attribution(tmp_path)
     store = Store(tmp_path / "test.db")
     store.initialize()
     _ready_route(store)
-    CrossPerpShadowEngine(
+    _engine(
         store,
         FakePreflight(_evidence(7_202_000)),
         now_ms=lambda: 7_202_000,
@@ -389,6 +456,10 @@ def test_cross_perp_paper_api_exposes_checks_positions_and_attribution(tmp_path)
     truth = client.get("/api/cross-perp/execution-truth").json()
     assert truth["paper_executable"] == 1
     assert truth["live_review_eligible"] is False
+    assert truth["requirements"]["execution_truth_scans"] == 3
+    assert truth["requirements"]["closed_paper_positions_for_live_review"] == 20
+    assert "fewer_than_20_closed_paper_positions" in truth["live_review_reasons"]
+    assert client.get("/api/cross-perp/funding-forecast-accuracy").status_code == 200
     positions = client.get("/api/cross-perp/paper/positions").json()
     assert positions[0]["asset"] == "SAGA"
     position_id = positions[0]["id"]
@@ -402,4 +473,7 @@ def test_cross_perp_paper_api_exposes_checks_positions_and_attribution(tmp_path)
     assert 'id="cross-perp-paper-heading"' in dashboard
     assert 'id="cross-perp-paper-rows"' in dashboard
     assert 'id="cross-perp-executable"' in dashboard
+    assert 'id="cross-perp-truth-streak"' in dashboard
+    assert 'id="cross-perp-forecast-sign"' in dashboard
+    assert 'id="cross-perp-forecast-samples"' in dashboard
     assert "loadCrossPerpPaper();" in dashboard

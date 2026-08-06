@@ -40,6 +40,7 @@ class ExecutionTruthConfig:
     leverage: float = 2.0
     maintenance_margin_pct: float = 5.0
     min_liquidation_buffer_pct: float = 20.0
+    entry_truth_scans: int = 3
     economic_exit_scans: int = 3
     reentry_cooldown_ms: int = 24 * HOUR_MS
 
@@ -73,6 +74,7 @@ class ExecutionTruthEvidence:
     committed_capital_usd: float
     liquidation_buffer_pct: float
     return_on_capital_24h_pct: float | None
+    forward_payments: tuple[dict[str, object], ...]
     paper_executable: bool
     readiness_level: str
     reasons: tuple[str, ...]
@@ -83,6 +85,7 @@ class ExecutionTruthEvidence:
         result["delayed_leg_samples"] = [
             sample.as_dict() for sample in self.delayed_leg_samples
         ]
+        result["forward_payments"] = list(self.forward_payments)
         result["execution_reasons"] = list(self.reasons)
         result["forward_funding_usd_24h"] = result.pop("forward_funding_usd")
         result["forward_net_profit_usd_24h"] = result.pop(
@@ -108,13 +111,13 @@ def evaluate_execution_truth(
     config: ExecutionTruthConfig = ExecutionTruthConfig(),
 ) -> ExecutionTruthEvidence:
     horizon_end_ms = observation.observed_at_ms + config.forward_horizon_hours * HOUR_MS
-    hyperliquid_settlements = _settlement_count(
+    hyperliquid_times = _settlement_times(
         hyperliquid_next_funding_at_ms,
         hyperliquid_funding_interval_ms,
         observation.observed_at_ms,
         horizon_end_ms,
     )
-    external_settlements = _settlement_count(
+    external_times = _settlement_times(
         external_next_funding_at_ms,
         external_funding_interval_ms,
         observation.observed_at_ms,
@@ -127,18 +130,40 @@ def evaluate_execution_truth(
     rates_available = (
         observation.hyperliquid_current_funding_rate is not None
         and observation.external_current_funding_rate is not None
-        and hyperliquid_settlements > 0
-        and external_settlements > 0
+        and bool(hyperliquid_times)
+        and bool(external_times)
     )
-    forward_funding_usd = None
+    forward_payments: tuple[dict[str, object], ...] = ()
+    forward_funding_usd: float | None = None
     if rates_available:
-        forward_funding_usd = notional_usd * (
-            float(observation.hyperliquid_current_funding_rate)
-            * hyperliquid_sign
-            * hyperliquid_settlements
-            + float(observation.external_current_funding_rate)
-            * external_sign
-            * external_settlements
+        forward_payments = tuple(
+            {
+                "leg": leg,
+                "settlement_at_ms": settlement_at_ms,
+                "predicted_rate": rate,
+                "direction_sign": direction_sign,
+                "notional_usd": notional_usd,
+                "predicted_pnl_usd": notional_usd * rate * direction_sign,
+            }
+            for leg, times, rate, direction_sign in (
+                (
+                    "hyperliquid",
+                    hyperliquid_times,
+                    float(observation.hyperliquid_current_funding_rate),
+                    hyperliquid_sign,
+                ),
+                (
+                    observation.external_venue,
+                    external_times,
+                    float(observation.external_current_funding_rate),
+                    external_sign,
+                ),
+            )
+            for settlement_at_ms in times
+        )
+        forward_funding_usd = sum(
+            float(payment["predicted_pnl_usd"])
+            for payment in forward_payments
         )
     transaction_cost = observation.transaction_cost_usd
     forward_net = (
@@ -216,8 +241,8 @@ def evaluate_execution_truth(
     paper_executable = bool(observation.qualified and not reasons)
     return ExecutionTruthEvidence(
         forward_horizon_hours=config.forward_horizon_hours,
-        hyperliquid_settlements=hyperliquid_settlements,
-        external_settlements=external_settlements,
+        hyperliquid_settlements=len(hyperliquid_times),
+        external_settlements=len(external_times),
         forward_funding_usd=forward_funding_usd,
         forward_net_profit_usd=forward_net,
         stressed_forward_net_profit_usd=stressed_forward_net,
@@ -230,24 +255,25 @@ def evaluate_execution_truth(
         committed_capital_usd=committed_capital,
         liquidation_buffer_pct=liquidation_buffer_pct,
         return_on_capital_24h_pct=return_on_capital,
+        forward_payments=forward_payments,
         paper_executable=paper_executable,
         readiness_level="paper_executable" if paper_executable else "preflight_failed",
         reasons=tuple(reasons),
     )
 
 
-def _settlement_count(
+def _settlement_times(
     next_at_ms: int | None,
     interval_ms: int | None,
     start_ms: int,
     end_ms: int,
-) -> int:
+) -> tuple[int, ...]:
     if next_at_ms is None or interval_ms is None or interval_ms <= 0:
-        return 0
+        return ()
     next_at_ms = max(next_at_ms, start_ms)
     if next_at_ms > end_ms:
-        return 0
-    return 1 + (end_ms - next_at_ms) // interval_ms
+        return ()
+    return tuple(range(next_at_ms, end_ms + 1, interval_ms))
 
 
 def _worst_delayed_leg_adverse_bps(
@@ -612,6 +638,12 @@ class CrossPerpShadowEngine:
                 refreshed[route_key] = self.preflight.refresh(route)
             except Exception as exc:
                 failures[route_key] = f"{type(exc).__name__}: {exc}"[:500]
+        for route_key, evidence in refreshed.items():
+            self.store.reconcile_cross_perp_funding_forecasts(
+                routes[route_key],
+                self._actual_funding_events(routes[route_key], evidence),
+                reconciled_at_ms=self.now_ms(),
+            )
 
         opened = 0
         checks_passed = 0
@@ -631,22 +663,64 @@ class CrossPerpShadowEngine:
                 if evidence is not None
                 else {"error": failures.get(route_key, "preflight unavailable")}
             )
-            passed = bool(truth is not None and truth.paper_executable)
+            truth_passed = bool(truth is not None and truth.paper_executable)
+            payload["execution_truth_passed"] = truth_passed
             cooldown_until_ms = self.store.cross_perp_route_cooldown_until(
                 route,
                 self.execution_config.reentry_cooldown_ms,
             )
             if cooldown_until_ms is not None and cooldown_until_ms > checked_at_ms:
-                passed = False
                 reasons = [*reasons, "route_cooldown"]
                 payload["cooldown_until_ms"] = cooldown_until_ms
             check_id = self.store.save_cross_perp_entry_check(
                 source_run_id=int(route["run_id"]),
                 route=route,
-                status="passed" if passed else "failed",
+                status="warming" if truth_passed else "failed",
                 reasons=reasons,
                 payload=payload,
                 checked_at_ms=checked_at_ms,
+            )
+            if truth is not None:
+                self.store.save_cross_perp_funding_forecasts(
+                    entry_check_id=check_id,
+                    source_run_id=int(route["run_id"]),
+                    route=route,
+                    predicted_at_ms=checked_at_ms,
+                    payments=list(truth.forward_payments),
+                )
+            truth_streak = self.store.cross_perp_execution_truth_streak(route)
+            streak_passed = truth_streak >= self.execution_config.entry_truth_scans
+            cooldown_active = bool(
+                cooldown_until_ms is not None and cooldown_until_ms > checked_at_ms
+            )
+            passed = truth_passed and streak_passed and not cooldown_active
+            if truth_passed and not streak_passed:
+                reasons = [
+                    *reasons,
+                    "execution_truth_streak_"
+                    f"{truth_streak}_of_{self.execution_config.entry_truth_scans}",
+                ]
+            payload.update(
+                {
+                    "execution_truth_streak": truth_streak,
+                    "required_execution_truth_streak": self.execution_config.entry_truth_scans,
+                    "paper_executable": passed,
+                    "readiness_level": (
+                        "paper_executable"
+                        if passed
+                        else "truth_streak_pending"
+                        if truth_passed and not cooldown_active
+                        else "route_cooldown"
+                        if cooldown_active
+                        else "preflight_failed"
+                    ),
+                }
+            )
+            self.store.update_cross_perp_entry_check(
+                check_id,
+                status=("passed" if passed else "warming" if truth_passed else "failed"),
+                reasons=reasons,
+                payload=payload,
             )
             checks_passed += int(passed)
             if (
@@ -718,6 +792,19 @@ class CrossPerpShadowEngine:
             "updated": updated,
             "closed": closed,
         }
+
+    @staticmethod
+    def _actual_funding_events(
+        route: Route,
+        evidence: CrossPerpPreflightEvidence,
+    ) -> list[tuple[str, int, float]]:
+        return [
+            ("hyperliquid", event.timestamp_ms, event.funding_rate)
+            for event in evidence.hyperliquid_funding_events
+        ] + [
+            (str(route["external_venue"]), event.timestamp_ms, event.funding_rate)
+            for event in evidence.external_funding_events
+        ]
 
     def _record_position_evidence(
         self,

@@ -187,6 +187,35 @@ class Store:
                     PRIMARY KEY (position_id, leg, timestamp_ms),
                     FOREIGN KEY (position_id) REFERENCES cross_perp_paper_positions(id)
                 );
+                CREATE TABLE IF NOT EXISTS cross_perp_funding_forecasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entry_check_id INTEGER NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    predicted_at_ms INTEGER NOT NULL,
+                    hyperliquid_dex TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    external_venue TEXT NOT NULL,
+                    external_symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    leg TEXT NOT NULL,
+                    settlement_at_ms INTEGER NOT NULL,
+                    predicted_rate REAL NOT NULL,
+                    direction_sign INTEGER NOT NULL,
+                    notional_usd REAL NOT NULL,
+                    predicted_pnl_usd REAL NOT NULL,
+                    actual_settlement_at_ms INTEGER,
+                    actual_rate REAL,
+                    actual_pnl_usd REAL,
+                    reconciled_at_ms INTEGER,
+                    UNIQUE (entry_check_id, leg, settlement_at_ms),
+                    FOREIGN KEY (entry_check_id) REFERENCES cross_perp_entry_checks(id),
+                    FOREIGN KEY (source_run_id) REFERENCES cross_perp_runs(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_cross_perp_forecast_pending
+                ON cross_perp_funding_forecasts(
+                    hyperliquid_dex, asset, external_venue, external_symbol,
+                    direction, leg, settlement_at_ms, reconciled_at_ms
+                );
                 CREATE TABLE IF NOT EXISTS paper_recommendations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at_ms INTEGER NOT NULL,
@@ -930,6 +959,254 @@ class Store:
             output.append(item)
         return output
 
+    def update_cross_perp_entry_check(
+        self,
+        check_id: int,
+        *,
+        status: str,
+        reasons: list[str],
+        payload: dict[str, object],
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE cross_perp_entry_checks
+                SET status = ?, reasons_json = ?, payload_json = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    json.dumps(reasons, separators=(",", ":")),
+                    json.dumps(payload, separators=(",", ":")),
+                    check_id,
+                ),
+            )
+
+    def cross_perp_execution_truth_streak(
+        self, route: dict[str, object]
+    ) -> int:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT source_run_id, payload_json
+                FROM cross_perp_entry_checks
+                WHERE hyperliquid_dex = ? AND asset = ?
+                    AND external_venue = ? AND external_symbol = ?
+                    AND direction = ?
+                ORDER BY id DESC
+                """,
+                (
+                    route["hyperliquid_dex"],
+                    route["asset"],
+                    route["external_venue"],
+                    route["external_symbol"],
+                    route["direction"],
+                ),
+            ).fetchall()
+        streak = 0
+        seen_runs: set[int] = set()
+        for row in rows:
+            source_run_id = int(row["source_run_id"])
+            if source_run_id in seen_runs:
+                continue
+            seen_runs.add(source_run_id)
+            payload = json.loads(str(row["payload_json"]))
+            if not bool(payload.get("execution_truth_passed")):
+                break
+            streak += 1
+        return streak
+
+    def save_cross_perp_funding_forecasts(
+        self,
+        *,
+        entry_check_id: int,
+        source_run_id: int,
+        route: dict[str, object],
+        predicted_at_ms: int,
+        payments: list[dict[str, object]],
+    ) -> int:
+        with self.connect() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO cross_perp_funding_forecasts (
+                    entry_check_id, source_run_id, predicted_at_ms,
+                    hyperliquid_dex, asset, external_venue, external_symbol,
+                    direction, leg, settlement_at_ms, predicted_rate,
+                    direction_sign, notional_usd, predicted_pnl_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        entry_check_id,
+                        source_run_id,
+                        predicted_at_ms,
+                        route["hyperliquid_dex"],
+                        route["asset"],
+                        route["external_venue"],
+                        route["external_symbol"],
+                        route["direction"],
+                        payment["leg"],
+                        payment["settlement_at_ms"],
+                        payment["predicted_rate"],
+                        payment["direction_sign"],
+                        payment["notional_usd"],
+                        payment["predicted_pnl_usd"],
+                    )
+                    for payment in payments
+                ],
+            )
+            return connection.total_changes - before
+
+    def reconcile_cross_perp_funding_forecasts(
+        self,
+        route: dict[str, object],
+        actual_events: list[tuple[str, int, float]],
+        *,
+        reconciled_at_ms: int,
+        tolerance_ms: int = 5 * 60_000,
+    ) -> int:
+        events_by_leg: dict[str, list[tuple[int, float]]] = {}
+        for leg, timestamp_ms, rate in actual_events:
+            events_by_leg.setdefault(leg, []).append((timestamp_ms, rate))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, leg, settlement_at_ms, direction_sign, notional_usd
+                FROM cross_perp_funding_forecasts
+                WHERE hyperliquid_dex = ? AND asset = ?
+                    AND external_venue = ? AND external_symbol = ?
+                    AND direction = ? AND reconciled_at_ms IS NULL
+                """,
+                (
+                    route["hyperliquid_dex"],
+                    route["asset"],
+                    route["external_venue"],
+                    route["external_symbol"],
+                    route["direction"],
+                ),
+            ).fetchall()
+            updates: list[tuple[int, float, float, int, int]] = []
+            for row in rows:
+                candidates = events_by_leg.get(str(row["leg"]), [])
+                if not candidates:
+                    continue
+                actual_timestamp, actual_rate = min(
+                    candidates,
+                    key=lambda event: abs(event[0] - int(row["settlement_at_ms"])),
+                )
+                if abs(actual_timestamp - int(row["settlement_at_ms"])) > tolerance_ms:
+                    continue
+                actual_pnl = (
+                    float(row["notional_usd"])
+                    * actual_rate
+                    * int(row["direction_sign"])
+                )
+                updates.append(
+                    (
+                        actual_timestamp,
+                        actual_rate,
+                        actual_pnl,
+                        reconciled_at_ms,
+                        int(row["id"]),
+                    )
+                )
+            connection.executemany(
+                """
+                UPDATE cross_perp_funding_forecasts
+                SET actual_settlement_at_ms = ?, actual_rate = ?,
+                    actual_pnl_usd = ?, reconciled_at_ms = ?
+                WHERE id = ? AND reconciled_at_ms IS NULL
+                """,
+                updates,
+            )
+        return len(updates)
+
+    def cross_perp_funding_forecast_accuracy(self) -> dict[str, object]:
+        with self.connect() as connection:
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM cross_perp_funding_forecasts
+                    ORDER BY predicted_at_ms DESC, id DESC
+                    """
+                ).fetchall()
+            ]
+        reconciled = [row for row in rows if row["reconciled_at_ms"] is not None]
+        now_ms = int(time.time() * 1_000)
+
+        def metrics(items: list[dict[str, object]]) -> dict[str, object]:
+            predicted = sum(float(item["predicted_pnl_usd"]) for item in items)
+            actual = sum(float(item["actual_pnl_usd"]) for item in items)
+            directional = [
+                item
+                for item in items
+                if abs(float(item["predicted_pnl_usd"])) > 1e-12
+            ]
+            sign_correct = sum(
+                1
+                for item in directional
+                if float(item["predicted_pnl_usd"])
+                * float(item["actual_pnl_usd"])
+                > 0
+            )
+            return {
+                "reconciled_predictions": len(items),
+                "reconciled_directional_predictions": len(directional),
+                "sign_accuracy_pct": (
+                    sign_correct / len(directional) * 100 if directional else None
+                ),
+                "predicted_pnl_usd": predicted,
+                "actual_pnl_usd": actual,
+                "capture_ratio_pct": (
+                    actual / predicted * 100 if abs(predicted) > 1e-9 else None
+                ),
+                "mean_absolute_error_usd": (
+                    sum(
+                        abs(
+                            float(item["actual_pnl_usd"])
+                            - float(item["predicted_pnl_usd"])
+                        )
+                        for item in items
+                    )
+                    / len(items)
+                    if items
+                    else None
+                ),
+            }
+
+        grouped: dict[tuple[object, ...], list[dict[str, object]]] = {}
+        for row in reconciled:
+            key = (
+                row["asset"],
+                row["external_venue"],
+                row["direction"],
+                row["leg"],
+            )
+            grouped.setdefault(key, []).append(row)
+        return {
+            "total_predictions": len(rows),
+            "pending_predictions": len(rows) - len(reconciled),
+            "overdue_predictions": sum(
+                1
+                for row in rows
+                if row["reconciled_at_ms"] is None
+                and int(row["settlement_at_ms"]) + 5 * 60_000 < now_ms
+            ),
+            **metrics(reconciled),
+            "by_route": [
+                {
+                    "asset": key[0],
+                    "external_venue": key[1],
+                    "direction": key[2],
+                    "leg": key[3],
+                    **metrics(items),
+                }
+                for key, items in sorted(grouped.items())
+            ],
+        }
+
     def open_cross_perp_paper_position(
         self,
         *,
@@ -1210,6 +1487,10 @@ class Store:
         }
 
     def cross_perp_execution_truth_summary(self) -> dict[str, object]:
+        min_closed_positions = 20
+        min_profitable_positions = 12
+        min_reconciled_forecasts = 30
+        min_forecast_sign_accuracy_pct = 60.0
         monitor = self.cross_perp_summary()
         checks = [
             item
@@ -1242,18 +1523,32 @@ class Store:
             item for item in closed if float(item["actual_net_pnl_usd"]) > 0
         ]
         realized_net = sum(float(item["actual_net_pnl_usd"]) for item in closed)
+        forecast_accuracy = self.cross_perp_funding_forecast_accuracy()
+        reconciled_forecasts = int(
+            forecast_accuracy["reconciled_directional_predictions"]
+        )
+        sign_accuracy = forecast_accuracy["sign_accuracy_pct"]
         live_review_eligible = bool(
-            len(closed) >= 3
-            and len(positive_closed) >= 3
+            len(closed) >= min_closed_positions
+            and len(positive_closed) >= min_profitable_positions
             and realized_net > 0
+            and reconciled_forecasts >= min_reconciled_forecasts
+            and sign_accuracy is not None
+            and float(sign_accuracy) >= min_forecast_sign_accuracy_pct
         )
         live_review_reasons: list[str] = []
-        if len(closed) < 3:
-            live_review_reasons.append("fewer_than_3_closed_paper_positions")
-        if len(positive_closed) < 3:
-            live_review_reasons.append("fewer_than_3_profitable_paper_positions")
+        if len(closed) < min_closed_positions:
+            live_review_reasons.append("fewer_than_20_closed_paper_positions")
+        if len(positive_closed) < min_profitable_positions:
+            live_review_reasons.append("fewer_than_12_profitable_paper_positions")
         if realized_net <= 0:
             live_review_reasons.append("aggregate_paper_pnl_non_positive")
+        if reconciled_forecasts < min_reconciled_forecasts:
+            live_review_reasons.append(
+                "fewer_than_30_reconciled_directional_funding_forecasts"
+            )
+        if sign_accuracy is None or float(sign_accuracy) < min_forecast_sign_accuracy_pct:
+            live_review_reasons.append("funding_forecast_sign_accuracy_below_60_pct")
         return {
             "monitoring_ready": int(monitor.get("ready_count", 0)),
             "preflight_checked": len(latest),
@@ -1262,12 +1557,19 @@ class Store:
             "live_review_reasons": live_review_reasons,
             "closed_paper_positions": len(closed),
             "profitable_closed_positions": len(positive_closed),
+            "funding_forecast_accuracy": forecast_accuracy,
             "requirements": {
                 "observation_scans": 3,
+                "execution_truth_scans": 3,
                 "depth_multiple": 3,
                 "forward_horizon_hours": 24,
                 "delayed_leg_ms": [100, 250, 500],
-                "positive_paper_positions_for_live_review": 3,
+                "closed_paper_positions_for_live_review": min_closed_positions,
+                "positive_paper_positions_for_live_review": min_profitable_positions,
+                "reconciled_directional_funding_forecasts_for_live_review": (
+                    min_reconciled_forecasts
+                ),
+                "minimum_forecast_sign_accuracy_pct": min_forecast_sign_accuracy_pct,
             },
             "latest_checks": latest,
         }

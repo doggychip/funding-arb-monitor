@@ -140,12 +140,17 @@
       <p class="subtle" id="cross-perp-paper-status" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">Loading second-check and simulated-position evidence…</p>
       <div class="stats" style="margin-top: 10px">
         <div class="stat"><div class="value" id="cross-perp-preflight">—</div><div class="label">Latest truth check</div></div>
+        <div class="stat"><div class="value" id="cross-perp-truth-streak">—</div><div class="label">Truth streak</div></div>
         <div class="stat"><div class="value" id="cross-perp-executable">—</div><div class="label">Paper executable</div></div>
         <div class="stat"><div class="value" id="cross-perp-live-review">—</div><div class="label">Live-review eligible</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-open">—</div><div class="label">Open simulations</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-closed">—</div><div class="label">Closed simulations</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-realized">—</div><div class="label">Realized net P&amp;L</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-error">—</div><div class="label">Forecast error</div></div>
+        <div class="stat"><div class="value" id="cross-perp-forecast-samples">—</div><div class="label">Funding forecasts reconciled</div></div>
+        <div class="stat"><div class="value" id="cross-perp-forecast-sign">—</div><div class="label">Forecast sign accuracy</div></div>
+        <div class="stat"><div class="value" id="cross-perp-forecast-capture">—</div><div class="label">Funding capture ratio</div></div>
+        <div class="stat"><div class="value" id="cross-perp-forecast-mae">—</div><div class="label">Forecast MAE / $1k</div></div>
       </div>
       <div class="panel">
         <div class="table-wrap" role="region" aria-label="Cross-perpetual shadow positions" tabindex="0">
@@ -527,8 +532,13 @@
         ]);
         const latestCheck = checks[0];
         document.querySelector("#cross-perp-preflight").textContent = latestCheck
-          ? latestCheck.status === "passed" ? "Passed" : "Failed"
+          ? latestCheck.status === "passed" ? "Passed" : latestCheck.status === "warming" ? "Warming" : "Failed"
           : "None";
+        const truthStreak = latestCheck?.evidence?.execution_truth_streak;
+        const truthRequired = latestCheck?.evidence?.required_execution_truth_streak ?? 3;
+        document.querySelector("#cross-perp-truth-streak").textContent = truthStreak == null
+          ? "—"
+          : `${truthStreak}/${truthRequired}`;
         document.querySelector("#cross-perp-executable").textContent = truth.paper_executable;
         document.querySelector("#cross-perp-live-review").textContent = truth.live_review_eligible ? "Yes" : "No";
         document.querySelector("#cross-perp-paper-open").textContent = attribution.open_positions;
@@ -539,6 +549,17 @@
         const error = document.querySelector("#cross-perp-paper-error");
         error.textContent = money.format(attribution.forecast_error_usd);
         error.className = `value ${numberClass(attribution.forecast_error_usd)}`;
+        const forecast = truth.funding_forecast_accuracy;
+        document.querySelector("#cross-perp-forecast-samples").textContent = forecast.reconciled_predictions;
+        document.querySelector("#cross-perp-forecast-sign").textContent = forecast.sign_accuracy_pct == null
+          ? "—"
+          : percent(forecast.sign_accuracy_pct);
+        document.querySelector("#cross-perp-forecast-capture").textContent = forecast.capture_ratio_pct == null
+          ? "—"
+          : percent(forecast.capture_ratio_pct);
+        document.querySelector("#cross-perp-forecast-mae").textContent = forecast.mean_absolute_error_usd == null
+          ? "—"
+          : money.format(forecast.mean_absolute_error_usd);
         document.querySelector("#cross-perp-paper-rows").innerHTML = attribution.positions.map((position) => {
           const state = position.closed_at_ms == null
             ? "Open simulation"
@@ -570,12 +591,17 @@
         status.textContent = "Cross-perpetual shadow evidence is unavailable; monitoring remains active.";
         status.setAttribute("aria-busy", "false");
         document.querySelector("#cross-perp-preflight").textContent = "—";
+        document.querySelector("#cross-perp-truth-streak").textContent = "—";
         document.querySelector("#cross-perp-executable").textContent = "—";
         document.querySelector("#cross-perp-live-review").textContent = "—";
         document.querySelector("#cross-perp-paper-open").textContent = "—";
         document.querySelector("#cross-perp-paper-closed").textContent = "—";
         document.querySelector("#cross-perp-paper-realized").textContent = "—";
         document.querySelector("#cross-perp-paper-error").textContent = "—";
+        document.querySelector("#cross-perp-forecast-samples").textContent = "—";
+        document.querySelector("#cross-perp-forecast-sign").textContent = "—";
+        document.querySelector("#cross-perp-forecast-capture").textContent = "—";
+        document.querySelector("#cross-perp-forecast-mae").textContent = "—";
         document.querySelector("#cross-perp-paper-rows").innerHTML = "";
         empty.style.display = "block";
       }

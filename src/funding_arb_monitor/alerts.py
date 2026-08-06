@@ -162,7 +162,7 @@ def render_cross_perp_shadow_entry(position: dict[str, object]) -> str:
         f"Direction: `{position['direction']}`\n"
         f"Notional per leg: `${float(position['notional_usd']):,.0f}`\n"
         f"{forecast_line}\n"
-        "Execution-truth preflight passed. Simulation only—no order was placed."
+        "Execution truth passed 3/3 scans. Simulation only—no order was placed."
     )
 
 
