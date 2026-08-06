@@ -139,7 +139,9 @@
       <h2 id="cross-perp-paper-heading">Cross-perpetual shadow evidence</h2>
       <p class="subtle" id="cross-perp-paper-status" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">Loading second-check and simulated-position evidence…</p>
       <div class="stats" style="margin-top: 10px">
-        <div class="stat"><div class="value" id="cross-perp-preflight">—</div><div class="label">Latest second check</div></div>
+        <div class="stat"><div class="value" id="cross-perp-preflight">—</div><div class="label">Latest truth check</div></div>
+        <div class="stat"><div class="value" id="cross-perp-executable">—</div><div class="label">Paper executable</div></div>
+        <div class="stat"><div class="value" id="cross-perp-live-review">—</div><div class="label">Live-review eligible</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-open">—</div><div class="label">Open simulations</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-closed">—</div><div class="label">Closed simulations</div></div>
         <div class="stat"><div class="value" id="cross-perp-paper-realized">—</div><div class="label">Realized net P&amp;L</div></div>
@@ -149,12 +151,12 @@
         <div class="table-wrap" role="region" aria-label="Cross-perpetual shadow positions" tabindex="0">
           <table aria-labelledby="cross-perp-paper-heading">
             <thead>
-              <tr><th scope="col">Route</th><th scope="col">Direction</th><th scope="col">State</th><th scope="col">Forecast 7d net</th><th scope="col">Actual funding</th><th scope="col">Basis MTM</th><th scope="col">Actual net</th><th scope="col">Forecast error</th><th scope="col">Opened</th></tr>
+              <tr><th scope="col">Route</th><th scope="col">Direction</th><th scope="col">State</th><th scope="col">Forward 24h net</th><th scope="col">Expected funding to date</th><th scope="col">Actual funding</th><th scope="col">Basis MTM</th><th scope="col">Actual net</th><th scope="col">Error to date</th><th scope="col">Opened</th></tr>
             </thead>
             <tbody id="cross-perp-paper-rows"></tbody>
           </table>
         </div>
-        <div id="cross-perp-paper-empty">No cross-perpetual shadow positions yet. A route must reach 3/3 and pass a fresh second public-data check.</div>
+        <div id="cross-perp-paper-empty">No cross-perpetual shadow positions yet. A route must reach 3/3 and pass every fresh execution-truth gate.</div>
       </div>
     </section>
 
@@ -512,20 +514,23 @@
       const empty = document.querySelector("#cross-perp-paper-empty");
       status.setAttribute("aria-busy", "true");
       try {
-        const [checksResponse, attributionResponse] = await Promise.all([
+        const [checksResponse, attributionResponse, truthResponse] = await Promise.all([
           apiFetch("/api/cross-perp/preflight?limit=1"),
-          apiFetch("/api/cross-perp/paper/attribution")
+          apiFetch("/api/cross-perp/paper/attribution"),
+          apiFetch("/api/cross-perp/execution-truth")
         ]);
-        if (!checksResponse.ok || !attributionResponse.ok) {
+        if (!checksResponse.ok || !attributionResponse.ok || !truthResponse.ok) {
           throw new Error("Cross-perp paper API request failed");
         }
-        const [checks, attribution] = await Promise.all([
-          checksResponse.json(), attributionResponse.json()
+        const [checks, attribution, truth] = await Promise.all([
+          checksResponse.json(), attributionResponse.json(), truthResponse.json()
         ]);
         const latestCheck = checks[0];
         document.querySelector("#cross-perp-preflight").textContent = latestCheck
           ? latestCheck.status === "passed" ? "Passed" : "Failed"
           : "None";
+        document.querySelector("#cross-perp-executable").textContent = truth.paper_executable;
+        document.querySelector("#cross-perp-live-review").textContent = truth.live_review_eligible ? "Yes" : "No";
         document.querySelector("#cross-perp-paper-open").textContent = attribution.open_positions;
         document.querySelector("#cross-perp-paper-closed").textContent = attribution.closed_positions;
         const realized = document.querySelector("#cross-perp-paper-realized");
@@ -543,24 +548,30 @@
               <td>${escapeHtml(`${position.asset}/${position.external_venue}`)}</td>
               <td>${escapeHtml(position.direction.replaceAll("_", " "))}</td>
               <td><span class="badge ${position.closed_at_ms == null ? "eligible" : "review"}">${escapeHtml(state)}</span></td>
-              <td class="${numberClass(position.forecast_net_profit_usd)}">${money.format(position.forecast_net_profit_usd)}</td>
+              <td class="${numberClass(position.forward_net_profit_usd_24h)}">${position.forward_net_profit_usd_24h == null ? "Legacy 7d: " + money.format(position.forecast_net_profit_usd) : money.format(position.forward_net_profit_usd_24h)}</td>
+              <td class="${numberClass(position.expected_funding_to_date_usd)}">${money.format(position.expected_funding_to_date_usd)}</td>
               <td class="${numberClass(position.funding_pnl_usd)}">${money.format(position.funding_pnl_usd)}</td>
               <td class="${numberClass(position.pair_mtm_usd)}">${money.format(position.pair_mtm_usd)}</td>
               <td class="${numberClass(position.actual_net_pnl_usd)}">${money.format(position.actual_net_pnl_usd)}</td>
-              <td class="${numberClass(position.forecast_error_usd)}">${position.forecast_error_usd == null ? "—" : money.format(position.forecast_error_usd)}</td>
+              <td class="${numberClass(position.forecast_error_to_date_usd)}">${money.format(position.forecast_error_to_date_usd)}</td>
               <td>${analysisAge(new Date(position.opened_at_ms).toISOString())}</td>
             </tr>
           `;
         }).join("");
         empty.style.display = attribution.positions.length ? "none" : "block";
+        const checkReasons = latestCheck?.reasons?.length
+          ? ` · ${latestCheck.reasons.slice(0, 4).map((reason) => reason.replaceAll("_", " ")).join("; ")}`
+          : "";
         status.textContent = latestCheck
-          ? `Latest second check: ${latestCheck.status} · ${analysisAge(new Date(latestCheck.checked_at_ms).toISOString())}`
+          ? `Latest execution-truth check: ${latestCheck.status} · ${analysisAge(new Date(latestCheck.checked_at_ms).toISOString())}${checkReasons}`
           : "No route has reached the second-check stage yet.";
         status.setAttribute("aria-busy", "false");
       } catch (error) {
         status.textContent = "Cross-perpetual shadow evidence is unavailable; monitoring remains active.";
         status.setAttribute("aria-busy", "false");
         document.querySelector("#cross-perp-preflight").textContent = "—";
+        document.querySelector("#cross-perp-executable").textContent = "—";
+        document.querySelector("#cross-perp-live-review").textContent = "—";
         document.querySelector("#cross-perp-paper-open").textContent = "—";
         document.querySelector("#cross-perp-paper-closed").textContent = "—";
         document.querySelector("#cross-perp-paper-realized").textContent = "—";

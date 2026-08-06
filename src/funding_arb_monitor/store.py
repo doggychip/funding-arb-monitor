@@ -290,6 +290,30 @@ class Store:
             self._ensure_column(connection, "paper_recommendations", "perp_ask_depth_usd", "REAL")
             self._ensure_column(connection, "paper_recommendations", "perp_spread_bps", "REAL")
             self._ensure_column(connection, "paper_recommendations", "perp_quote_at_ms", "INTEGER")
+            self._ensure_column(
+                connection,
+                "cross_perp_paper_positions",
+                "forward_funding_usd_24h",
+                "REAL",
+            )
+            self._ensure_column(
+                connection,
+                "cross_perp_paper_positions",
+                "forward_net_profit_usd_24h",
+                "REAL",
+            )
+            self._ensure_column(
+                connection,
+                "cross_perp_paper_positions",
+                "committed_capital_usd",
+                "REAL",
+            )
+            self._ensure_column(
+                connection,
+                "cross_perp_paper_positions",
+                "readiness_level",
+                "TEXT",
+            )
 
     @staticmethod
     def _ensure_column(
@@ -932,8 +956,10 @@ class Store:
                     external_quantity, entry_fee_usd, estimated_exit_fee_usd,
                     forecast_funding_usd, forecast_transaction_cost_usd,
                     forecast_net_profit_usd, forecast_net_apr_pct,
-                    forecast_basis_bps
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    forecast_basis_bps, forward_funding_usd_24h,
+                    forward_net_profit_usd_24h, committed_capital_usd,
+                    readiness_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry_check_id,
@@ -956,6 +982,10 @@ class Store:
                     evidence["net_profit_usd"],
                     evidence["net_apr_7d_pct"],
                     evidence["basis_bps"],
+                    evidence.get("forward_funding_usd_24h"),
+                    evidence.get("forward_net_profit_usd_24h"),
+                    evidence.get("committed_capital_usd"),
+                    evidence.get("readiness_level"),
                 ),
             )
         return int(cursor.lastrowid)
@@ -1037,6 +1067,48 @@ class Store:
                     json.dumps(reasons, separators=(",", ":")),
                 ),
             )
+
+    def cross_perp_paper_failure_streak(self, position_id: int) -> int:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT qualified FROM cross_perp_paper_marks
+                WHERE position_id = ? ORDER BY timestamp_ms DESC
+                """,
+                (position_id,),
+            ).fetchall()
+        streak = 0
+        for row in rows:
+            if bool(row["qualified"]):
+                break
+            streak += 1
+        return streak
+
+    def cross_perp_route_cooldown_until(
+        self,
+        route: dict[str, object],
+        cooldown_ms: int,
+    ) -> int | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT closed_at_ms FROM cross_perp_paper_positions
+                WHERE hyperliquid_dex = ? AND asset = ?
+                    AND external_venue = ? AND external_symbol = ?
+                    AND direction = ? AND closed_at_ms IS NOT NULL
+                ORDER BY closed_at_ms DESC LIMIT 1
+                """,
+                (
+                    route["hyperliquid_dex"],
+                    route["asset"],
+                    route["external_venue"],
+                    route["external_symbol"],
+                    route["direction"],
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["closed_at_ms"]) + cooldown_ms
 
     def close_cross_perp_paper_position(
         self,
@@ -1125,7 +1197,79 @@ class Store:
             "cost_variance_usd": sum(
                 float(item["cost_variance_usd"]) for item in closed
             ),
+            "expected_funding_to_date_usd": sum(
+                float(item["expected_funding_to_date_usd"]) for item in positions
+            ),
+            "funding_variance_to_date_usd": sum(
+                float(item["funding_variance_to_date_usd"]) for item in positions
+            ),
+            "forecast_error_to_date_usd": sum(
+                float(item["forecast_error_to_date_usd"]) for item in positions
+            ),
             "positions": positions,
+        }
+
+    def cross_perp_execution_truth_summary(self) -> dict[str, object]:
+        monitor = self.cross_perp_summary()
+        checks = [
+            item
+            for item in self.latest_cross_perp_entry_checks(500)
+            if item["source_run_id"] == monitor.get("id")
+        ]
+        latest_by_route: dict[tuple[object, ...], dict[str, object]] = {}
+        for check in checks:
+            route = (
+                check["hyperliquid_dex"],
+                check["asset"],
+                check["external_venue"],
+                check["external_symbol"],
+                check["direction"],
+            )
+            latest_by_route.setdefault(route, check)
+        latest = list(latest_by_route.values())
+        paper_executable = [
+            item
+            for item in latest
+            if item["status"] == "passed"
+            and bool(item["evidence"].get("paper_executable"))
+        ]
+        closed = [
+            item
+            for item in self.cross_perp_paper_positions()
+            if item["closed_at_ms"] is not None
+        ]
+        positive_closed = [
+            item for item in closed if float(item["actual_net_pnl_usd"]) > 0
+        ]
+        realized_net = sum(float(item["actual_net_pnl_usd"]) for item in closed)
+        live_review_eligible = bool(
+            len(closed) >= 3
+            and len(positive_closed) >= 3
+            and realized_net > 0
+        )
+        live_review_reasons: list[str] = []
+        if len(closed) < 3:
+            live_review_reasons.append("fewer_than_3_closed_paper_positions")
+        if len(positive_closed) < 3:
+            live_review_reasons.append("fewer_than_3_profitable_paper_positions")
+        if realized_net <= 0:
+            live_review_reasons.append("aggregate_paper_pnl_non_positive")
+        return {
+            "monitoring_ready": int(monitor.get("ready_count", 0)),
+            "preflight_checked": len(latest),
+            "paper_executable": len(paper_executable),
+            "live_review_eligible": live_review_eligible,
+            "live_review_reasons": live_review_reasons,
+            "closed_paper_positions": len(closed),
+            "profitable_closed_positions": len(positive_closed),
+            "requirements": {
+                "observation_scans": 3,
+                "depth_multiple": 3,
+                "forward_horizon_hours": 24,
+                "delayed_leg_ms": [100, 250, 500],
+                "positive_paper_positions_for_live_review": 3,
+            },
+            "latest_checks": latest,
         }
 
     def start_scheduled_job(self, name: str, scheduled_slot: str) -> int:
@@ -1855,6 +1999,17 @@ class Store:
         forecast_cost = float(result["forecast_transaction_cost_usd"])
         forecast_net = float(result["forecast_net_profit_usd"])
         closed = result["closed_at_ms"] is not None
+        forward_funding = result.get("forward_funding_usd_24h")
+        forecast_horizon_ms = 24 * 3_600_000 if forward_funding is not None else 7 * 86_400_000
+        end_ms = int(result["closed_at_ms"] or time.time() * 1_000)
+        elapsed_fraction = min(
+            max(end_ms - int(result["opened_at_ms"]), 0) / forecast_horizon_ms,
+            1.0,
+        )
+        expected_funding_to_date = float(
+            forward_funding if forward_funding is not None else forecast_funding
+        ) * elapsed_fraction
+        expected_net_to_date = expected_funding_to_date - forecast_cost
         result.update(
             {
                 "actual_cost_usd": actual_cost,
@@ -1864,6 +2019,11 @@ class Store:
                 ),
                 "cost_variance_usd": forecast_cost - actual_cost if closed else None,
                 "forecast_error_usd": actual_net - forecast_net if closed else None,
+                "expected_funding_to_date_usd": expected_funding_to_date,
+                "expected_net_to_date_usd": expected_net_to_date,
+                "funding_variance_to_date_usd": funding_pnl
+                - expected_funding_to_date,
+                "forecast_error_to_date_usd": actual_net - expected_net_to_date,
             }
         )
         return result

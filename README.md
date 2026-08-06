@@ -104,19 +104,25 @@ consecutive qualifying scans; that label is evidence for monitoring, never an ex
 
 The protected read endpoints are `GET /api/cross-perp/summary`,
 `GET /api/cross-perp/opportunities`, `GET /api/cross-perp/history`,
-`GET /api/cross-perp/preflight`, `GET /api/cross-perp/paper/positions`, and
-`GET /api/cross-perp/paper/attribution`. They expose monitoring and simulation evidence only: this
+`GET /api/cross-perp/preflight`, `GET /api/cross-perp/execution-truth`,
+`GET /api/cross-perp/paper/positions`, and `GET /api/cross-perp/paper/attribution`. They expose
+monitoring and simulation evidence only: this
 feature remains read-only, accepts no exchange credentials, and is not actionable or approved for
 trading. Cross-perpetual degradation is shown in the dashboard and summary endpoint but is
 non-critical to `/readyz`.
 
-After the hourly scan, every 3/3 observation-ready route receives a second public-data check. The
-check independently refreshes both perpetual books, funding histories, marks, depth, fees, basis,
-and the deterministic qualification rules. A shadow position opens only when that check passes.
+After the hourly scan, every 3/3 observation-ready route receives an execution-truth check. It
+uses the announced next funding rates and exact settlement schedules for a 24-hour forward model,
+requires at least 3x the $1,000 notional in visible depth, re-quotes both legs after 100, 250, and
+500 milliseconds, and reports a $250/$500/$1,000/$2,000 capacity curve. It also models collateral
+on both venues at fixed 2x leverage, a fee/slippage reserve, liquidation buffer, and return on total
+committed capital. A shadow position opens only when every execution-truth gate passes.
 The paper ledger records both leg quantities, venue-specific funding accruals, executable pair MTM,
-fees, conservative exits, and forecast-versus-actual attribution. It closes a simulation when the
-route loses observation readiness, the second check no longer qualifies, or the seven-day holding
-limit is reached. Transition alerts are emitted only when a route becomes ready, loses readiness,
+fees, conservative exits, and forecast-versus-actual-to-date attribution. Economic deterioration
+must persist for three consecutive checks before a normal exit; stale data, unfillable depth, an
+excessive basis, or an inadequate liquidation buffer remains a hard exit. A closed route has a
+24-hour re-entry cooldown. The seven-day holding limit remains in force. Transition alerts are
+emitted only when a route becomes ready, loses readiness,
 or newly suffers depth/economic deterioration; repeated unchanged scans do not alert again.
 
 ### Optional Zhihuiti integration
@@ -262,7 +268,9 @@ Back up the `/data` volume before deployment. On startup, `Store.initialize()` c
 `paper_liquidity_checks`, `alert_deliveries`, `cross_perp_entry_checks`,
 `cross_perp_paper_positions`, `cross_perp_paper_marks`, and `cross_perp_paper_accruals` tables and
 adds nullable exit-execution columns to `paper_positions`. Existing rows and IDs are preserved.
-Verify `/healthz`, both paper ledgers, the cross-perpetual attribution endpoint, and
+It also adds nullable 24-hour forward-funding, forward-profit, committed-capital, and readiness
+columns to existing cross-perpetual paper positions. Verify `/healthz`, both paper ledgers, the
+cross-perpetual execution-truth and attribution endpoints, and
 `/api/alerts/deliveries` after deployment. Rolling back the application image is safe because the
 previous version ignores these additive tables and columns.
 

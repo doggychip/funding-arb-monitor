@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from funding_arb_monitor.api import create_app
@@ -9,6 +10,8 @@ from funding_arb_monitor.cross_perp import CrossPerpObservation
 from funding_arb_monitor.cross_perp_paper import (
     CrossPerpPreflightEvidence,
     CrossPerpShadowEngine,
+    DelayedLegSample,
+    evaluate_execution_truth,
 )
 from funding_arb_monitor.cross_perp_venues import PerpFundingEvent
 from funding_arb_monitor.store import Store
@@ -99,11 +102,25 @@ def _evidence(
     observed_at_ms: int,
     *,
     qualified: bool = True,
+    reasons: tuple[str, ...] | None = None,
 ) -> CrossPerpPreflightEvidence:
+    failure_reasons = reasons or ("net_carry_non_positive",)
     observation = _observation(
         observed_at_ms,
         qualified=qualified,
-        reasons=() if qualified else ("net_carry_non_positive",),
+        reasons=() if qualified else failure_reasons,
+    )
+    delayed_samples = tuple(
+        DelayedLegSample(delay, 0.999, 1.002, 1.0, True)
+        for delay in (100, 250, 500)
+    )
+    truth = evaluate_execution_truth(
+        observation,
+        hyperliquid_next_funding_at_ms=observed_at_ms + 3_600_000,
+        hyperliquid_funding_interval_ms=3_600_000,
+        external_next_funding_at_ms=observed_at_ms + 3_600_000,
+        external_funding_interval_ms=8 * 3_600_000,
+        delayed_leg_samples=delayed_samples,
     )
     return CrossPerpPreflightEvidence(
         observation=observation,
@@ -115,7 +132,64 @@ def _evidence(
         external_funding_events=(
             PerpFundingEvent(observed_at_ms, 0.0002),
         ),
+        execution_truth=truth,
     )
+
+
+def test_execution_truth_uses_forward_rates_and_requires_three_times_depth() -> None:
+    observation = _observation(1_000)
+    samples = tuple(
+        DelayedLegSample(delay, 0.999, 1.002, 1.0, True)
+        for delay in (100, 250, 500)
+    )
+
+    truth = evaluate_execution_truth(
+        observation,
+        hyperliquid_next_funding_at_ms=3_601_000,
+        hyperliquid_funding_interval_ms=3_600_000,
+        external_next_funding_at_ms=3_601_000,
+        external_funding_interval_ms=8 * 3_600_000,
+        delayed_leg_samples=samples,
+    )
+
+    assert truth.hyperliquid_settlements == 24
+    assert truth.external_settlements == 3
+    assert truth.forward_funding_usd == pytest.approx(23.4)
+    assert truth.paper_executable is True
+    assert truth.depth_multiple == 5
+    assert truth.return_on_capital_24h_pct is not None
+
+    shallow = evaluate_execution_truth(
+        replace(
+            observation,
+            hyperliquid_depth_usd=2_999,
+            external_depth_usd=10_000,
+        ),
+        hyperliquid_next_funding_at_ms=3_601_000,
+        hyperliquid_funding_interval_ms=3_600_000,
+        external_next_funding_at_ms=3_601_000,
+        external_funding_interval_ms=8 * 3_600_000,
+        delayed_leg_samples=samples,
+    )
+    assert shallow.paper_executable is False
+    assert "depth_below_3x_notional" in shallow.reasons
+
+
+def test_execution_truth_fails_delayed_leg_stress() -> None:
+    observation = _observation(1_000)
+    truth = evaluate_execution_truth(
+        observation,
+        hyperliquid_next_funding_at_ms=3_601_000,
+        hyperliquid_funding_interval_ms=3_600_000,
+        external_next_funding_at_ms=3_601_000,
+        external_funding_interval_ms=8 * 3_600_000,
+        delayed_leg_samples=(
+            DelayedLegSample(100, 0.995, 1.002, 40.0, False),
+        ),
+    )
+
+    assert truth.paper_executable is False
+    assert "delayed_leg_stress_failed" in truth.reasons
 
 
 def test_shadow_engine_requires_ready_route_and_second_preflight(tmp_path) -> None:
@@ -176,32 +250,103 @@ def test_shadow_engine_closes_and_attributes_forecast_error(tmp_path) -> None:
         now_ms=lambda: opened_at_ms,
     ).run()
 
-    lost_at_ms = 10_801_000
-    _save_run(
-        store,
-        replace(
-            _observation(lost_at_ms),
-            qualified=False,
-            reasons=("net_carry_non_positive",),
-        ),
-    )
-    result = CrossPerpShadowEngine(
-        store,
-        FakePreflight(_evidence(lost_at_ms, qualified=False)),
-        now_ms=lambda: lost_at_ms,
-    ).run()
+    result = None
+    for index in range(3):
+        lost_at_ms = 10_801_000 + index * 3_600_000
+        _save_run(
+            store,
+            replace(
+                _observation(lost_at_ms),
+                qualified=False,
+                reasons=("net_carry_non_positive",),
+            ),
+        )
+        result = CrossPerpShadowEngine(
+            store,
+            FakePreflight(_evidence(lost_at_ms, qualified=False)),
+            now_ms=lambda timestamp=lost_at_ms: timestamp,
+        ).run()
+        assert result["closed"] == int(index == 2)
 
+    assert result is not None
     assert result["closed"] == 1
     position = store.cross_perp_paper_positions()[0]
-    assert position["exit_reason"] == "observation_readiness_lost"
-    assert position["funding_pnl_usd"] == 0.8
+    assert position["exit_reason"] == "economic_deterioration_3_scans"
+    assert position["funding_pnl_usd"] == 2.4
     assert position["actual_net_pnl_usd"] != position["forecast_net_profit_usd"]
     assert position["forecast_error_usd"] == (
         position["actual_net_pnl_usd"] - position["forecast_net_profit_usd"]
     )
     attribution = store.cross_perp_paper_attribution()
     assert attribution["closed_positions"] == 1
-    assert attribution["funding_variance_usd"] == 0.8 - 42
+    assert attribution["funding_variance_usd"] == 2.4 - 42
+
+
+def test_shadow_engine_exits_immediately_for_hard_risk(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _ready_route(store)
+    opened_at_ms = 7_202_000
+    CrossPerpShadowEngine(
+        store,
+        FakePreflight(_evidence(opened_at_ms)),
+        now_ms=lambda: opened_at_ms,
+    ).run()
+    stale_at_ms = 10_801_000
+    _save_run(
+        store,
+        replace(
+            _observation(stale_at_ms),
+            qualified=False,
+            reasons=("stale_mark",),
+        ),
+    )
+
+    result = CrossPerpShadowEngine(
+        store,
+        FakePreflight(
+            _evidence(stale_at_ms, qualified=False, reasons=("stale_mark",))
+        ),
+        now_ms=lambda: stale_at_ms,
+    ).run()
+
+    assert result["closed"] == 1
+    assert store.cross_perp_paper_positions()[0]["exit_reason"] == (
+        "hard_risk_stale_mark"
+    )
+
+
+def test_shadow_engine_enforces_route_reentry_cooldown(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    store.initialize()
+    _ready_route(store)
+    opened_at_ms = 7_202_000
+    CrossPerpShadowEngine(
+        store,
+        FakePreflight(_evidence(opened_at_ms)),
+        now_ms=lambda: opened_at_ms,
+    ).run()
+    position = store.open_cross_perp_paper_positions()[0]
+    closed_at_ms = opened_at_ms + 1_000
+    store.close_cross_perp_paper_position(
+        int(position["id"]),
+        closed_at_ms=closed_at_ms,
+        reason="test_close",
+        hyperliquid_exit_price=1.001,
+        external_exit_price=1.0,
+        exit_fee_usd=0.95,
+    )
+
+    result = CrossPerpShadowEngine(
+        store,
+        FakePreflight(_evidence(closed_at_ms + 1_000)),
+        now_ms=lambda: closed_at_ms + 1_000,
+    ).run()
+
+    assert result["opened"] == 0
+    check = store.latest_cross_perp_entry_checks()[0]
+    assert check["status"] == "failed"
+    assert "route_cooldown" in check["reasons"]
 
 
 def test_cross_perp_transitions_are_emitted_only_on_state_change(tmp_path) -> None:
@@ -241,6 +386,9 @@ def test_cross_perp_paper_api_exposes_checks_positions_and_attribution(tmp_path)
     client = TestClient(create_app(str(store.path)))
 
     assert client.get("/api/cross-perp/preflight").json()[0]["status"] == "passed"
+    truth = client.get("/api/cross-perp/execution-truth").json()
+    assert truth["paper_executable"] == 1
+    assert truth["live_review_eligible"] is False
     positions = client.get("/api/cross-perp/paper/positions").json()
     assert positions[0]["asset"] == "SAGA"
     position_id = positions[0]["id"]
@@ -253,4 +401,5 @@ def test_cross_perp_paper_api_exposes_checks_positions_and_attribution(tmp_path)
     dashboard = client.get("/").text
     assert 'id="cross-perp-paper-heading"' in dashboard
     assert 'id="cross-perp-paper-rows"' in dashboard
+    assert 'id="cross-perp-executable"' in dashboard
     assert "loadCrossPerpPaper();" in dashboard

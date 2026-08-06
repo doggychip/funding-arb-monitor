@@ -184,6 +184,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> list[dict[str, object]]:
         return store.latest_cross_perp_entry_checks(limit)
 
+    @app.get("/api/cross-perp/execution-truth")
+    def cross_perp_execution_truth() -> dict[str, object]:
+        return store.cross_perp_execution_truth_summary()
+
     @app.get("/api/cross-perp/paper/positions")
     def cross_perp_paper_positions(
         include_closed: bool = False,

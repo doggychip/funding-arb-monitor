@@ -193,15 +193,15 @@ class HyperliquidClient:
     def _book_vwap(
         levels: list[dict[str, object]], notional_usd: float
     ) -> tuple[float | None, float]:
+        parsed_levels = [
+            (float(level["px"]), float(level["sz"])) for level in levels
+        ]
         remaining = notional_usd
         filled_quantity = 0.0
         filled_notional = 0.0
-        total_depth = 0.0
-        for level in levels:
-            price = float(level["px"])
-            quantity = float(level["sz"])
+        total_depth = sum(price * quantity for price, quantity in parsed_levels)
+        for price, quantity in parsed_levels:
             level_notional = price * quantity
-            total_depth += level_notional
             take_notional = min(remaining, level_notional)
             filled_notional += take_notional
             filled_quantity += take_notional / price

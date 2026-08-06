@@ -49,6 +49,8 @@ class ExternalPerpMarket:
     funding_captured_at_ms: int
     funding_events: tuple[PerpFundingEvent, ...]
     quote: PerpBookQuote
+    next_funding_at_ms: int | None = None
+    funding_interval_ms: int | None = None
 
 
 class ExternalPerpVenue(Protocol):
@@ -59,6 +61,10 @@ class ExternalPerpVenue(Protocol):
     def market(
         self, instrument: PerpInstrument, *, days: int, notional_usd: float
     ) -> ExternalPerpMarket: ...
+
+    def quote(
+        self, instrument: PerpInstrument, *, notional_usd: float
+    ) -> PerpBookQuote: ...
 
 
 def _book_vwap(levels: object, notional_usd: float) -> tuple[float | None, float]:
@@ -202,10 +208,32 @@ class BinancePerpVenue:
                     book=book,
                     notional_usd=notional_usd,
                 ),
+                next_funding_at_ms=(
+                    int(premium["nextFundingTime"])
+                    if premium.get("nextFundingTime") is not None
+                    else None
+                ),
+                funding_interval_ms=_funding_interval_ms(funding_events),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("invalid Binance perpetual market response") from exc
         return market
+
+    def quote(
+        self, instrument: PerpInstrument, *, notional_usd: float
+    ) -> PerpBookQuote:
+        depth_query = urllib.parse.urlencode(
+            {"symbol": instrument.symbol, "limit": 500}
+        )
+        book = self.get_json(f"{self.base_url}/fapi/v1/depth?{depth_query}")
+        return _quote_from_book(
+            venue=self.name,
+            asset=instrument.asset,
+            symbol=instrument.symbol,
+            fee_bps=self.fee_bps,
+            book=book,
+            notional_usd=notional_usd,
+        )
 
 
 class OkxPerpVenue:
@@ -292,9 +320,35 @@ class OkxPerpVenue:
                     book=book,
                     notional_usd=notional_usd,
                 ),
+                next_funding_at_ms=(
+                    int(funding_row["nextFundingTime"])
+                    if funding_row.get("nextFundingTime") is not None
+                    else None
+                ),
+                funding_interval_ms=_funding_interval_ms(history),
             )
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("invalid OKX perpetual market response") from exc
+
+    def quote(
+        self, instrument: PerpInstrument, *, notional_usd: float
+    ) -> PerpBookQuote:
+        book_query = urllib.parse.urlencode({"instId": instrument.symbol, "sz": 400})
+        payload = self.get_json(f"{self.base_url}/market/books?{book_query}")
+        try:
+            if not isinstance(payload, dict):
+                raise TypeError
+            book = payload["data"][0]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise RuntimeError("invalid OKX perpetual order book response") from exc
+        return _quote_from_book(
+            venue=self.name,
+            asset=instrument.asset,
+            symbol=instrument.symbol,
+            fee_bps=self.fee_bps,
+            book=book,
+            notional_usd=notional_usd,
+        )
 
     def _funding_history(self, symbol: str, days: int) -> tuple[PerpFundingEvent, ...]:
         window_start_ms = int((time.time() - days * 86_400) * 1000)
@@ -326,3 +380,16 @@ class OkxPerpVenue:
                 break
             before = oldest_timestamp
         return tuple(events)
+
+
+def _funding_interval_ms(events: tuple[PerpFundingEvent, ...]) -> int | None:
+    timestamps = sorted({event.timestamp_ms for event in events})
+    intervals = [
+        later - earlier
+        for earlier, later in zip(timestamps, timestamps[1:])
+        if later > earlier
+    ]
+    if not intervals:
+        return None
+    intervals.sort()
+    return intervals[len(intervals) // 2]

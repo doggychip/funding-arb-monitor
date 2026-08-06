@@ -62,6 +62,7 @@ def test_binance_market_uses_funding_history_and_executable_depth() -> None:
             "symbol": "ZROUSDT",
             "markPrice": "2.00",
             "lastFundingRate": "0.0001",
+            "nextFundingTime": 1_100_000,
             "time": 1_000_000,
         },
         "/fapi/v1/fundingRate": [
@@ -86,6 +87,8 @@ def test_binance_market_uses_funding_history_and_executable_depth() -> None:
     assert market.current_funding_rate == 0.0001
     assert market.mark_price == 2.0
     assert market.mark_captured_at_ms == 1_000_000
+    assert market.next_funding_at_ms == 1_100_000
+    assert market.funding_interval_ms == 100
     assert [point.funding_rate for point in market.funding_events] == [0.0001, -0.0002]
     assert market.quote.executable_buy_price == 2.01
     assert market.quote.executable_sell_price == 1.99
@@ -106,7 +109,15 @@ def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
         parsed = urllib.parse.urlsplit(url)
         query = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/api/v5/public/funding-rate":
-            return {"data": [{"fundingRate": "0.0001", "fundingTime": str(now_ms)}]}
+            return {
+                "data": [
+                    {
+                        "fundingRate": "0.0001",
+                        "fundingTime": str(now_ms),
+                        "nextFundingTime": str(now_ms + 8 * 3_600_000),
+                    }
+                ]
+            }
         if parsed.path == "/api/v5/public/funding-rate-history":
             history_requests.append(query)
             before = query.get("before", [None])[0]
@@ -159,6 +170,7 @@ def test_okx_market_paginates_history_with_oldest_timestamp_as_before() -> None:
 
     assert market.mark_price == 2.0
     assert market.mark_captured_at_ms == now_ms
+    assert market.next_funding_at_ms == now_ms + 8 * 3_600_000
     assert [point.funding_rate for point in market.funding_events] == [0.0001, -0.0002, 0.0003]
     assert market.quote.executable_buy_price == 2.01
     assert market.quote.executable_sell_price == 1.99

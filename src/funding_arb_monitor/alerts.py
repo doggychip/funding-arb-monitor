@@ -150,13 +150,19 @@ def render_cross_perp_transitions(events: list[dict[str, object]]) -> str:
 
 
 def render_cross_perp_shadow_entry(position: dict[str, object]) -> str:
+    forward_net = position.get("forward_net_profit_usd_24h")
+    forecast_line = (
+        f"Forward 24h net: `${float(forward_net):+.2f}`"
+        if forward_net is not None
+        else f"Legacy forecast 7d net: `${float(position['forecast_net_profit_usd']):+.2f}`"
+    )
     return (
         "🧪 **Cross-perpetual shadow position opened**\n"
         f"Route: `{position['asset']}/{position['external_venue']}`\n"
         f"Direction: `{position['direction']}`\n"
         f"Notional per leg: `${float(position['notional_usd']):,.0f}`\n"
-        f"Forecast 7d net: `${float(position['forecast_net_profit_usd']):+.2f}`\n"
-        "Second public-data preflight passed. Simulation only—no order was placed."
+        f"{forecast_line}\n"
+        "Execution-truth preflight passed. Simulation only—no order was placed."
     )
 
 

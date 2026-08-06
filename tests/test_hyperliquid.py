@@ -138,3 +138,28 @@ def test_perp_book_quote_preserves_partial_depth_for_cross_perp() -> None:
     assert quote.executable_buy_price is None
     assert quote.bid_depth_usd == pytest.approx(1_980.0)
     assert quote.ask_depth_usd == pytest.approx(202.0)
+
+
+def test_perp_book_quote_reports_depth_beyond_the_fill_level() -> None:
+    client = HyperliquidClient()
+    book = {
+        "time": 1,
+        "levels": [
+            [
+                {"px": "100", "sz": "10", "n": 1},
+                {"px": "99", "sz": "10", "n": 1},
+                {"px": "98", "sz": "20", "n": 1},
+            ],
+            [
+                {"px": "101", "sz": "10", "n": 1},
+                {"px": "102", "sz": "10", "n": 1},
+                {"px": "103", "sz": "20", "n": 1},
+            ],
+        ],
+    }
+
+    with patch.object(client, "post", return_value=book):
+        quote = client.perp_book_quote("TEST", "(main)", 1_000)
+
+    assert quote.bid_depth_usd == pytest.approx(3_950)
+    assert quote.ask_depth_usd == pytest.approx(4_090)
